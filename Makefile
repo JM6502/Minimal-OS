@@ -4,6 +4,8 @@ LD := $(toolchain_home)/cross/bin/x86_64-elf-ld
 
 QEMU_NETDEV ?= user,id=net0
 QEMU_AUDIO_DRIVER ?= none
+HOSTCC ?= gcc
+HOST_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -I src/intf
 
 .DEFAULT_GOAL := build-x86_64
 
@@ -121,6 +123,14 @@ run-dex: build-x86_64
 .PHONY: ci-test
 ci-test:
 	bash tools/debug/ci_test.sh
+
+.PHONY: test-host
+test-host: build/tests/host/gfx_blit_tests
+	./build/tests/host/gfx_blit_tests
+
+build/tests/host/gfx_blit_tests: tests/host/gfx_blit_tests.c src/impl/handlers/gfx_blit.c
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) $^ -o $@
 
 .PHONY: ci-interact
 ci-interact:
