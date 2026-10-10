@@ -1,6 +1,8 @@
 #include "print.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/multiboot2parse.h"
+#include "x86_64/boot_options.h"
+#include "x86_64/memory_test.h"
 #include "x86_64/startuproutine.h"
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
@@ -35,6 +37,8 @@
 #include "net/tcp.h"
 #include "x86_64/net_syscall.h"
 #include "x86_64/random.h"
+
+bool kernel_boot_no_disk;
 
 
 void busy(void) {
@@ -78,6 +82,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     smp_init_bsp();
     gdt_init();
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
+    kernel_boot_no_disk = multiboot2_has_cmdline_token(mb_info, "no-disk");
     uint64_t total_ram_bytes = get_total_memory(mb_info);
     print_clear();
     commandhandler_init();
@@ -115,9 +120,14 @@ void kernel_main(uint64_t mb2_info_addr) {
     // Registers every built-in gpu_hw_driver_t with gpu_manager and
     // initializes whichever one is actually present. See
     // gpu_manager.h / gpu_hw.h for the module interface.
+    gpu_multiboot2_set_info(mb_info);
+    gpu_manager_register_driver(gpu_multiboot2_get_driver());
     gpu_manager_register_driver(gpu_bochs_vbe_get_driver());
     if (!gpu_manager_init()) {
         serial_write_str("No display driver available - continuing headless\n");
+    }
+    if (multiboot2_has_cmdline_token(mb_info, "memtest")) {
+        memory_test_run();
     }
     const char* proc_list[32];
     getprocslistNames(proc_list, 32);
@@ -133,12 +143,22 @@ void kernel_main(uint64_t mb2_info_addr) {
         // Handle table + per-port UDP receive queues that SYS_NET
         // hands to user processes (see net_syscall.c).
         net_syscall_init();
-        serial_write_str("Network: interface ready (run 'dhcp' to get an address)\n");
+        uint8_t mac[6];
+        network_manager_get_mac(mac);
+        if (mac[0] == 0x52 && mac[1] == 0x54 && mac[2] == 0x00 &&
+            mac[3] == 0x12 && mac[4] == 0x34 &&
+            (mac[5] == 0x56 || mac[5] == 0x57)) {
+            uint32_t static_ip = (mac[5] == 0x56) ? 0xC0A86402u : 0xC0A86403u;
+            ip_configure(static_ip, 0xFFFFFF00u, 0);
+            serial_write_str("Network: run-two static LAN address configured\n");
+        } else {
+            serial_write_str("Network: interface ready (run 'dhcp' to get an address)\n");
+        }
     } else {
         serial_write_str("Network: no supported NIC found\n");
     }
 
-    time_set_from_str("2026-08-19 18:50:30");
+    time_set_from_str_if_newer(BUILD_DATE);
 
     // Seeded after the clock is set so the RTC contributes something
     // real. Userland reaches this through SYS_RANDOM.

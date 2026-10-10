@@ -342,19 +342,19 @@ bool pkglib_info(const char* archive_path, uint32_t* out_entry_count) {
 
 typedef struct {
     char rel_name[MPKG_NAME_SIZE];
-    char full_path[MINIMAFS_MAX_PATH];
+    char full_path[256];
     bool is_dir;
 } pkg_zip_item_t;
 
+#define PKGLIB_ZIP_MAX_ITEMS 16
+static pkg_zip_item_t g_zip_items[PKGLIB_ZIP_MAX_ITEMS];
+
 static bool pkg_zip_add_item(pkg_zip_item_t** items, uint32_t* count, uint32_t* capacity,
                              const char* rel_name, const char* full_path, bool is_dir) {
+    if (strlen(full_path) >= sizeof(((pkg_zip_item_t*)0)->full_path)) return false;
+
     if (*count >= *capacity) {
-        uint32_t new_cap = (*capacity == 0) ? 16 : (*capacity * 2);
-        pkg_zip_item_t* bigger =
-            (pkg_zip_item_t*)alloc_resize(*items, (size_t)new_cap * sizeof(pkg_zip_item_t));
-        if (!bigger) return false;
-        *items = bigger;
-        *capacity = new_cap;
+        return false;
     }
 
     pkg_zip_item_t* it = &(*items)[(*count)++];
@@ -368,9 +368,7 @@ static bool pkg_zip_add_item(pkg_zip_item_t** items, uint32_t* count, uint32_t* 
 
 static bool pkg_zip_collect_dir(const char* full_dir_path, const char* rel_prefix,
                                 pkg_zip_item_t** items, uint32_t* count, uint32_t* capacity) {
-    minimafs_dir_entry_t* entries = (minimafs_dir_entry_t*)alloc(
-        MINIMAFS_MAX_ROOT_ENTRIES * sizeof(minimafs_dir_entry_t));
-    if (!entries) return false;
+    minimafs_dir_entry_t entries[MINIMAFS_MAX_ROOT_ENTRIES];
 
     uint32_t n = minimafs_list_dir(full_dir_path, entries, MINIMAFS_MAX_ROOT_ENTRIES);
     bool ok = true;
@@ -403,8 +401,6 @@ static bool pkg_zip_collect_dir(const char* full_dir_path, const char* rel_prefi
             }
         }
     }
-
-    free_mem(entries);
     return ok;
 }
 
@@ -422,7 +418,7 @@ static void pkg_zip_free_all(pkg_zip_item_t* items,
     if (raw_sizes)     free_mem(raw_sizes);
     if (methods)       free_mem(methods);
     if (data_offsets)  free_mem(data_offsets);
-    if (items)         free_mem(items);
+    if (items && items != g_zip_items) free_mem(items);
 }
 
 bool pkglib_zip(const char* source_path, const char* algorithm,
@@ -450,11 +446,12 @@ bool pkglib_zip(const char* source_path, const char* algorithm,
         }
     }
 
-    pkg_zip_item_t* items = NULL;
-    uint32_t item_count = 0, item_capacity = 0;
+    pkg_zip_item_t* items = g_zip_items;
+    uint32_t item_count = 0, item_capacity = PKGLIB_ZIP_MAX_ITEMS;
     bool source_is_dir = minimafs_is_dir(source_path);
 
     if (source_is_dir) {
+        serial_write_str("pkglib: collecting archive entries\n");
         if (!pkg_zip_collect_dir(source_path, "", &items, &item_count, &item_capacity)) {
             serial_write_str("pkglib: failed to walk directory (OOM?)\n");
             pkg_zip_free_all(items, NULL, 0, NULL, NULL, NULL, NULL);
@@ -508,6 +505,7 @@ bool pkglib_zip(const char* source_path, const char* algorithm,
             continue;
         }
 
+        serial_write_str("pkglib: reading archive payload\n");
         minimafs_file_handle_t* f = minimafs_open(items[i].full_path, true);
         if (!f) {
             serial_write_str("pkglib: failed to open ");
@@ -576,41 +574,30 @@ bool pkglib_zip(const char* source_path, const char* algorithm,
     uint32_t running = table_size;
     for (uint32_t i = 0; i < item_count; i++) {
         if (items[i].is_dir) { data_offsets[i] = 0; continue; }
+        if (payload_sizes[i] > UINT32_MAX - running) {
+            serial_write_str("pkglib: archive is too large\n");
+            pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, data_offsets);
+            return false;
+        }
         data_offsets[i] = running;
         running += payload_sizes[i];
     }
 
-    if (minimafs_exists(output_path)) {
+    uint8_t* archive = (uint8_t*)alloc(running);
+    if (!archive) {
+        serial_write_str("pkglib: OOM building archive\n");
         minimafs_delete_file(output_path);
-    }
-    if (!minimafs_create_file(output_path, "binary", "mpkg")) {
-        serial_write_str("pkglib: failed to create ");
-        serial_write_str(output_path);
-        serial_write_str("\n");
         pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, data_offsets);
         return false;
     }
 
-    minimafs_file_handle_t* out = minimafs_open(output_path, false);
-    if (!out) {
-        serial_write_str("pkglib: failed to open output for writing\n");
-        pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, data_offsets);
-        return false;
-    }
+    memset(archive, 0, running);
+    memcpy(archive, MPKG_MAGIC, MPKG_MAGIC_SIZE);
+    pkg_write_u32(archive + 8, MPKG_VERSION);
+    pkg_write_u32(archive + 12, item_count);
 
-    bool write_ok = true;
-
-    {
-        uint8_t header[MPKG_HEADER_SIZE];
-        memcpy(header, MPKG_MAGIC, MPKG_MAGIC_SIZE);
-        pkg_write_u32(header + 8, MPKG_VERSION);
-        pkg_write_u32(header + 12, item_count);
-        if (minimafs_write(out, header, sizeof(header)) != sizeof(header)) write_ok = false;
-    }
-
-    for (uint32_t i = 0; write_ok && i < item_count; i++) {
-        uint8_t entry[MPKG_ENTRY_SIZE];
-        memset(entry, 0, sizeof(entry));
+    for (uint32_t i = 0; i < item_count; i++) {
+        uint8_t* entry = archive + MPKG_HEADER_SIZE + i * MPKG_ENTRY_SIZE;
         strncpy((char*)entry, items[i].rel_name, MPKG_NAME_SIZE - 1);
 
         uint32_t off = MPKG_NAME_SIZE;
@@ -620,25 +607,23 @@ bool pkglib_zip(const char* source_path, const char* algorithm,
         off += pkg_write_u32(entry + off, raw_sizes[i]);
         off += pkg_write_u32(entry + off, payload_sizes[i]);
         off += pkg_write_u32(entry + off, data_offsets[i]);
-
-        if (minimafs_write(out, entry, sizeof(entry)) != sizeof(entry)) write_ok = false;
     }
 
-    for (uint32_t i = 0; write_ok && i < item_count; i++) {
+    for (uint32_t i = 0; i < item_count; i++) {
         if (!items[i].is_dir && payload_sizes[i] > 0) {
-            if (minimafs_write(out, payloads[i], payload_sizes[i]) != payload_sizes[i]) {
-                write_ok = false;
-            }
+            memcpy(archive + data_offsets[i], payloads[i], payload_sizes[i]);
         }
     }
 
-    minimafs_close(out);
+    serial_write_str("pkglib: writing archive\n");
+    bool write_ok = minimafs_write_file_segments(output_path, archive, running,
+                                                 NULL, 0, "binary", "mpkg");
+    free_mem(archive);
 
     if (!write_ok) {
-        serial_write_str("pkglib: write failed, archive may be incomplete: ");
+        serial_write_str("pkglib: write failed: ");
         serial_write_str(output_path);
         serial_write_str("\n");
-        minimafs_delete_file(output_path);
         pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, data_offsets);
         return false;
     }

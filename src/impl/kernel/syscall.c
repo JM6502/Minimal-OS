@@ -25,6 +25,16 @@
 #include "x86_64/net_syscall.h"
 #include "x86_64/random.h"
 #include "x86_64/runcommand.h"
+#include "x86_64/proc.h"
+#include "fspaths.h"
+
+static minimafs_dir_entry_t g_listdir_entries[MINIMAFS_MAX_ROOT_ENTRIES];
+static volatile int     g_listdir_entries_lock;
+
+static const char* syscall_resolve_path(const char* input, char* resolved) {
+    if (!input || !resolved || !fs_resolve_path(input, resolved)) return NULL;
+    return resolved;
+}
 
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     if (!buf) return SYS_ERR_INVAL;
@@ -304,12 +314,15 @@ static uint64_t sys_listdir_impl(const char* path, syscall_dirent_t* out,
                                  uint32_t max_entries) {
     if (!path || !out || max_entries == 0) return SYS_ERR_INVAL;
 
+    char resolved[MINIMAFS_MAX_PATH];
+    path = syscall_resolve_path(path, resolved);
+    if (!path) return SYS_ERR_INVAL;
+
     uint32_t cap = max_entries;
     if (cap > MINIMAFS_MAX_ROOT_ENTRIES) cap = MINIMAFS_MAX_ROOT_ENTRIES;
 
-    minimafs_dir_entry_t* entries =
-        (minimafs_dir_entry_t*)alloc(cap * sizeof(minimafs_dir_entry_t));
-    if (!entries) return SYS_ERR_GENERIC;
+    while (__sync_lock_test_and_set(&g_listdir_entries_lock, 1)) { }
+    minimafs_dir_entry_t* entries = (minimafs_dir_entry_t*)g_listdir_entries;
 
     uint32_t count = minimafs_list_dir(path, entries, cap);
     for (uint32_t i = 0; i < count; i++) {
@@ -319,7 +332,7 @@ static uint64_t sys_listdir_impl(const char* path, syscall_dirent_t* out,
         out[i].hidden = entries[i].hidden ? 1 : 0;
     }
 
-    free_mem(entries);
+    __sync_lock_release(&g_listdir_entries_lock);
     return count;
 }
 
@@ -345,26 +358,30 @@ static uint64_t sys_get_metadata_impl(const char* path, syscall_file_metadata_t*
 }
 
 static uint64_t sys_pkg_impl(const syscall_pkg_request_t* request) {
+    serial_write_str("SYS_PKG: dispatch\n");
     if (!request || !request->path) return SYS_ERR_INVAL;
 
-    switch (request->op) {
+    syscall_pkg_request_t local = *request;
+
+    switch (local.op) {
         case SYS_PKG_UNZIP: {
-            if (!request->extra) return SYS_ERR_INVAL;
+            if (!local.extra) return SYS_ERR_INVAL;
             uint32_t installed = 0, failed = 0;
-            bool ok = pkglib_unzip(request->path, request->extra, &installed, &failed);
-            if (request->out_count) *request->out_count = installed;
-            if (request->out_failed) *request->out_failed = failed;
+            bool ok = pkglib_unzip(local.path, local.extra, &installed, &failed);
+            if (local.out_count) *local.out_count = installed;
+            if (local.out_failed) *local.out_failed = failed;
             return ok ? SYS_SUCCESS : SYS_ERR_GENERIC;
         }
         case SYS_PKG_ZIP: {
-            bool ok = pkglib_zip(request->path, request->extra,
-                                 request->out_path, request->out_path_size);
+            serial_write_str("SYS_PKG: zip\n");
+            bool ok = pkglib_zip(local.path, local.extra,
+                                 local.out_path, local.out_path_size);
             return ok ? SYS_SUCCESS : SYS_ERR_GENERIC;
         }
         case SYS_PKG_INFO: {
             uint32_t count = 0;
-            bool ok = pkglib_info(request->path, &count);
-            if (request->out_count) *request->out_count = count;
+            bool ok = pkglib_info(local.path, &count);
+            if (local.out_count) *local.out_count = count;
             return ok ? SYS_SUCCESS : SYS_ERR_GENERIC;
         }
         default:
@@ -448,40 +465,92 @@ static uint64_t sys_pslist_impl(syscall_process_info_t* out, uint32_t max_entrie
  * needs denying, so adding a new syscall doesn't require remembering
  * to update this table or it silently becomes forbidden.
  * ============================================================ */
-/*
- * SYS_HEAP - userland dynamic memory.
- *
- * Until now a .run program had no heap at all: no malloc, no sbrk, no
- * mmap, just whatever fit in .bss and its stack. That rules out any
- * program whose working set is not known at compile time.
- *
- * Because every process still shares the kernel's PML4 (see
- * proc_create()), this is a direct shim over the kernel allocator
- * rather than a separate user address space. That means a buggy .run
- * program can corrupt the kernel heap - which is already true of
- * everything else it can do, so this adds no new trust boundary. When
- * per-process page tables land, this becomes the natural place to
- * carve out a real user heap region instead.
- */
+/* User allocations use the kernel heap, but ownership is tracked per
+ * process so free/resize can be validated and leaked blocks reclaimed
+ * when the scheduler reaps that process. */
+static bool sys_heap_make_user_accessible(void* ptr, uint64_t size) {
+	if (!isCurrentProcessUser()) return true;
+	uintptr_t address = (uintptr_t)ptr;
+	if (!current_process || !ptr || address < 64 || size > SIZE_MAX - 128) return false;
+	return proc_map_user_heap_range(current_process, (void*)(address - 64),
+					(size_t)size + 128);
+}
+
 static uint64_t sys_heap_impl(uint64_t op, void* ptr, uint64_t size) {
     switch (op) {
         case SYS_HEAP_ALLOC: {
             if (size == 0) return SYS_ERR_INVAL;
             void* mem = alloc_unzeroed((size_t)size);
+            if (mem && isCurrentProcessUser()) {
+                if (!proc_user_heap_track(current_process, mem, (size_t)size)) {
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+                if (!sys_heap_make_user_accessible(mem, size)) {
+                    proc_user_heap_untrack(current_process, mem);
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+            }
             return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
         }
         case SYS_HEAP_ALLOC_ZEROED: {
             if (size == 0) return SYS_ERR_INVAL;
             void* mem = alloc((size_t)size);
+            if (mem && isCurrentProcessUser()) {
+                if (!proc_user_heap_track(current_process, mem, (size_t)size)) {
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+                if (!sys_heap_make_user_accessible(mem, size)) {
+                    proc_user_heap_untrack(current_process, mem);
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+            }
             return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
         }
         case SYS_HEAP_FREE:
-            free_mem(ptr);          // already NULL-safe
+            if (isCurrentProcessUser()) {
+                if (!ptr) return SYS_SUCCESS;
+                if (!proc_user_heap_contains(current_process, ptr)) {
+                    return SYS_ERR_INVAL;
+                }
+                if (!proc_user_heap_untrack(current_process, ptr)) {
+                    return SYS_ERR_GENERIC;
+                }
+            }
+            free_mem(ptr);
             return SYS_SUCCESS;
         case SYS_HEAP_RESIZE: {
+            bool user_process = isCurrentProcessUser();
+            if (user_process && ptr &&
+                !proc_user_heap_contains(current_process, ptr)) {
+                return SYS_ERR_INVAL;
+            }
+            if (size == 0) {
+                if (user_process && ptr &&
+                    !proc_user_heap_untrack(current_process, ptr)) {
+                    return SYS_ERR_GENERIC;
+                }
+                alloc_resize(ptr, 0);
+                return SYS_SUCCESS;
+            }
             void* mem = alloc_resize(ptr, (size_t)size);
-            if (size == 0) return SYS_SUCCESS;
-            return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
+            if (!mem) return SYS_ERR_GENERIC;
+            if (user_process) {
+                if (!proc_user_heap_resize(current_process, ptr, mem,
+                                           (size_t)size)) {
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+                if (!sys_heap_make_user_accessible(mem, size)) {
+                    proc_user_heap_untrack(current_process, mem);
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+            }
+            return (uint64_t)(uintptr_t)mem;
         }
         default:
             return SYS_ERR_INVAL;
@@ -495,14 +564,34 @@ static uint64_t sys_random_impl(void* buf, uint64_t len) {
 }
 
 static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc) {
-    if (!path) return SYS_ERR_INVAL;
-    if (argc > 16) return SYS_ERR_INVAL;      // run_launch_file's own ceiling
+    if (!path) { serial_write_str("SYS_EXEC: missing path\n"); return SYS_ERR_INVAL; }
+    if (argc > 16) { serial_write_str("SYS_EXEC: too many args\n"); return SYS_ERR_INVAL; }
+
+    serial_write_str("SYS_EXEC: request path=");
+    serial_write_str(path);
+    serial_write_str(" argc=");
+    serial_write_dec(argc);
+    serial_write_str("\n");
 
     char normalized[MINIMAFS_MAX_PATH];
-    if (!run_normalize_path(path, normalized, sizeof(normalized))) return SYS_ERR_INVAL;
+    if (!run_normalize_path(path, normalized, sizeof(normalized))) {
+        serial_write_str("SYS_EXEC: invalid path\n");
+        return SYS_ERR_INVAL;
+    }
+
+    serial_write_str("SYS_EXEC: normalized path=");
+    serial_write_str(normalized);
+    serial_write_str(" exists=");
+    serial_write_dec(minimafs_exists(normalized) ? 1 : 0);
+    serial_write_str(" dir=");
+    serial_write_dec(minimafs_is_dir(normalized) ? 1 : 0);
+    serial_write_str("\n");
 
     process_t* proc = run_launch_file(normalized, (int)argc, argv);
-    if (!proc) return SYS_ERR_GENERIC;
+    if (!proc) {
+        serial_write_str("SYS_EXEC: launch failed\n");
+        return SYS_ERR_GENERIC;
+    }
     return proc->pid;
 }
 
@@ -629,7 +718,7 @@ void syscall_dispatch(syscall_regs_t* regs) {
             // noreturn - tears this process down and context-switches
             // away for good. Nothing after this ever runs, including
             // isr_syscall_wrapped's iretq.
-            process_exit();
+            process_exit_with_status((uint8_t)regs->rdi, false, 0);
             break;
         }
 
@@ -662,6 +751,12 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_OPEN: {
             const char* path = (const char*)regs->rdi;
+            if (!path) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             if (!path) {
                 regs->rax = SYS_ERR_INVAL;
                 break;
@@ -712,18 +807,24 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_EXISTS: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_exists(path) ? 1 : 0) : SYS_ERR_INVAL;
             break;
         }
 
         case SYS_IS_DIR: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_is_dir(path) ? 1 : 0) : SYS_ERR_INVAL;
             break;
         }
 
         case SYS_MKDIR: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_mkdir(path) ? SYS_SUCCESS : SYS_ERR_GENERIC)
                              : SYS_ERR_INVAL;
             break;
@@ -735,10 +836,16 @@ void syscall_dispatch(syscall_regs_t* regs) {
             const void* buf = (const void*)regs->rsi;
             uint64_t len = regs->rdx;
             if (!handle || !buf) {
+                serial_write_str("SYS_FWRITE: invalid handle or buffer\n");
                 regs->rax = SYS_ERR_INVAL;
                 break;
             }
             regs->rax = minimafs_write(handle, buf, (uint32_t)len);
+            serial_write_str("SYS_FWRITE: requested=");
+            serial_write_dec((uint32_t)len);
+            serial_write_str(" wrote=");
+            serial_write_dec((uint32_t)regs->rax);
+            serial_write_str("\n");
             break;
         }
 
@@ -752,6 +859,8 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_DELETE: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_delete_file(path) ? SYS_SUCCESS : SYS_ERR_GENERIC)
                              : SYS_ERR_INVAL;
             break;
@@ -759,6 +868,8 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_RMDIR: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_rmdir(path) ? SYS_SUCCESS : SYS_ERR_GENERIC)
                              : SYS_ERR_INVAL;
             break;
@@ -767,6 +878,8 @@ void syscall_dispatch(syscall_regs_t* regs) {
         case SYS_GET_METADATA: {
             const char* path = (const char*)regs->rdi;
             syscall_file_metadata_t* out = (syscall_file_metadata_t*)regs->rsi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = sys_get_metadata_impl(path, out);
             break;
         }
@@ -803,10 +916,30 @@ void syscall_dispatch(syscall_regs_t* regs) {
                 regs->rax = SYS_ERR_INVAL;
                 break;
             }
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
+            if (!path) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
             regs->rax = minimafs_create_file(path,
                                              type   ? type   : "binary",
                                              format ? format : "bin")
                         ? SYS_SUCCESS : SYS_ERR_GENERIC;
+            break;
+        }
+
+        case SYS_GETCWD: {
+            char* out = (char*)regs->rdi;
+            uint64_t cap = regs->rsi;
+            const char* cwd = fs_get_current_directory();
+            size_t len = cwd ? strlen(cwd) : 0;
+            if (!out || cap == 0 || !cwd || len + 1 > cap) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
+            memcpy(out, cwd, len + 1);
+            regs->rax = SYS_SUCCESS;
             break;
         }
 

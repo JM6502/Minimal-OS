@@ -27,6 +27,8 @@ static void help_general(void) {
     help_item("clear", "Clear the terminal.");
     help_item("sleep <seconds|Nms>", "Pause for seconds or milliseconds.");
     help_item("systime", "Show the current system time.");
+    help_item("shutdown", "Power off using ACPI S5.");
+    help_item("reboot", "Restart using ACPI or legacy reset controls.");
 }
 
 static void help_system_information(void) {
@@ -97,7 +99,7 @@ static void help_networking(void) {
     help_section("Networking");
     help_item("ifconfig", "Show network interface status.");
     help_item("dhcp", "Request an IP address from the router.");
-    help_item("wget <url> [-d <path>]", "Fetch a URL over HTTP; print or save to file.");
+    help_item("wget <url> [-d <path>]", "Fetch an HTTP or HTTPS URL; print or save to file.");
 }
 
 typedef void (*help_page_func_t)(void);

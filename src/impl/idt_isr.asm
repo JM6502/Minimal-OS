@@ -53,10 +53,12 @@ ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
 
-; On entry: [rsp+0]=vector, [rsp+8]=error_code, CPU exception frame above that.
+; On entry: [rsp+0]=vector, [rsp+8]=error_code, [rsp+16]=saved RIP.
 isr_common_stub:
     mov rdi, [rsp]         ; arg1 = vector
     mov rsi, [rsp + 8]     ; arg2 = error_code
+    mov rdx, [rsp + 16]    ; arg3 = saved RIP
+    mov rcx, [rsp + 24]    ; arg4 = saved CS (privilege level)
 
     push rax
     push rcx

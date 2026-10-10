@@ -4,6 +4,7 @@
 #include "panic.h"
 #include "applications/terminal.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/boot_options.h"
 #include "keyboard/usbkeyboard.h"
 #include "usb/usb_stack.h"
 #include "x86_64/commandhandler.h"
@@ -11,6 +12,7 @@
 #include "string.h"
 #include "time.h"
 #include "x86_64/servicemanager.h"
+#include "x86_64/acpi.h"
 
 #include "vgaterm.h"
 #include "minimafshandler.h"
@@ -28,9 +30,14 @@ gpu_device_t g_gpu;
 terminal_t* terminal;
 
 #define INPUT_BUFFER_SIZE 256
+#define COMMAND_HISTORY_SIZE 25
 static char input_buffer[INPUT_BUFFER_SIZE];
 static uint16_t input_pos = 0;
 static bool command_ready = false;
+static char command_history[COMMAND_HISTORY_SIZE][INPUT_BUFFER_SIZE];
+static uint16_t command_history_count = 0;
+static int16_t command_history_index = -1;
+static char command_history_current[INPUT_BUFFER_SIZE];
 
 // True while a command process launched via command_execute_async() is
 // running. While this is true:
@@ -39,7 +46,40 @@ static bool command_ready = false;
 //   - ordinary keystrokes are ignored by terminal_keyboard_callback()
 //   - Ctrl+C kills the running command process instead of editing input
 static bool g_command_running = false;
+static bool g_prompt_waiting = false;
 static uint64_t g_last_ctrl_c_ms = 0;
+void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed);
+
+/*
+ * QEMU's serial device is the only dependable input channel in a
+ * display-less test.  Feed its bytes through the same terminal callback as
+ * the USB keyboard so headless automation exercises the normal command
+ * parser instead of requiring monitor "sendkey" support.
+ */
+static void terminal_poll_serial_input(void) {
+    static bool previous_was_cr = false;
+
+    /* A hostile or accidentally connected serial peer must not starve the
+     * terminal process forever. */
+    for (uint16_t i = 0; i < INPUT_BUFFER_SIZE && serial_received(); i++) {
+        char c = serial_read();
+
+        if (c == '\r') {
+            terminal_keyboard_callback(USB_KEY_ENTER, '\n', true);
+            previous_was_cr = true;
+        } else if (c == '\n') {
+            if (!previous_was_cr)
+                terminal_keyboard_callback(USB_KEY_ENTER, '\n', true);
+            previous_was_cr = false;
+        } else if (c == '\b' || (uint8_t)c == 0x7f) {
+            terminal_keyboard_callback(USB_KEY_BACKSPACE, '\b', true);
+            previous_was_cr = false;
+        } else if ((uint8_t)c >= 32 && (uint8_t)c <= 126) {
+            terminal_keyboard_callback(0, c, true);
+            previous_was_cr = false;
+        }
+    }
+}
 
 // ===========================================
 // TERMINAL RENDERING
@@ -59,6 +99,81 @@ void terminalPrompt(void) {
     graphics_write_textr("Computer@local-");
     graphics_write_textr(fs_get_current_directory());
     graphics_write_textr("$ ");
+}
+
+static void terminal_erase_last_char(void) {
+    if (input_pos == 0) return;
+
+    input_pos--;
+    input_buffer[input_pos] = '\0';
+
+    if (terminal->cursor_x > 0) {
+        terminal->cursor_x--;
+    } else if (terminal->cursor_y > 0) {
+        terminal->cursor_y--;
+        terminal->cursor_x = terminal->cols - 1;
+    }
+
+    uint16_t saved_x = terminal->cursor_x;
+    uint16_t saved_y = terminal->cursor_y;
+    graphics_write_textr_char(' ');
+    terminal->cursor_x = saved_x;
+    terminal->cursor_y = saved_y;
+}
+
+static void terminal_erase_input(void) {
+    while (input_pos > 0) terminal_erase_last_char();
+}
+
+static void terminal_replace_input(const char* text) {
+    terminal_erase_input();
+    strncpy(input_buffer, text, INPUT_BUFFER_SIZE - 1);
+    input_buffer[INPUT_BUFFER_SIZE - 1] = '\0';
+    input_pos = (uint16_t)strlen(input_buffer);
+    graphics_write_textr(input_buffer);
+}
+
+static void terminal_add_history(const char* command) {
+    if (!command || command[0] == '\0') return;
+
+    if (command_history_count < COMMAND_HISTORY_SIZE) {
+        strncpy(command_history[command_history_count], command, INPUT_BUFFER_SIZE - 1);
+        command_history[command_history_count][INPUT_BUFFER_SIZE - 1] = '\0';
+        command_history_count++;
+        return;
+    }
+
+    for (uint16_t i = 1; i < COMMAND_HISTORY_SIZE; i++) {
+        strncpy(command_history[i - 1], command_history[i], INPUT_BUFFER_SIZE);
+    }
+    strncpy(command_history[COMMAND_HISTORY_SIZE - 1], command, INPUT_BUFFER_SIZE - 1);
+    command_history[COMMAND_HISTORY_SIZE - 1][INPUT_BUFFER_SIZE - 1] = '\0';
+}
+
+static void terminal_history_up(void) {
+    if (command_history_count == 0) return;
+
+    if (command_history_index < 0) {
+        strncpy(command_history_current, input_buffer, INPUT_BUFFER_SIZE - 1);
+        command_history_current[INPUT_BUFFER_SIZE - 1] = '\0';
+        command_history_index = (int16_t)command_history_count - 1;
+    } else if (command_history_index > 0) {
+        command_history_index--;
+    }
+
+    terminal_replace_input(command_history[command_history_index]);
+}
+
+static void terminal_history_down(void) {
+    if (command_history_index < 0) return;
+
+    if (command_history_index < (int16_t)command_history_count - 1) {
+        command_history_index++;
+        terminal_replace_input(command_history[command_history_index]);
+    } else {
+        command_history_index = -1;
+        terminal_replace_input(command_history_current);
+    }
 }
 
 // ===========================================
@@ -91,10 +206,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             command_kill_running();
         }
         g_last_ctrl_c_ms = 0;
-        if (!g_command_running) {
-            graphics_write_textr("^C\n");
-            terminalPrompt();
-        }
+        graphics_write_textr("^C\n");
         return;
     }
 
@@ -109,6 +221,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
         } else {
             input_pos = 0;
             input_buffer[0] = '\0';
+            command_history_index = -1;
             graphics_write_textr("^C\n");
             terminalPrompt();
         }
@@ -122,7 +235,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
      * terminal_update()) - there's nowhere for other keystrokes to go, so
      * ignore them until the command finishes or is killed above.
      */
-    if (g_command_running) {
+    if (g_command_running || command_has_last_user_program()) {
         return;
     }
     
@@ -132,6 +245,8 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             // Submit command
             graphics_write_textr("\n");
             input_buffer[input_pos] = '\0';
+            terminal_add_history(input_buffer);
+            command_history_index = -1;
             command_ready = true;
             serial_write_str("Terminal: Command ready: '");
             serial_write_str(input_buffer);
@@ -139,29 +254,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             break;
             
         case USB_KEY_BACKSPACE:
-            if (input_pos > 0) {
-                input_pos--;
-                input_buffer[input_pos] = '\0';
-                
-                // Move cursor back
-                if (terminal->cursor_x > 0) {
-                    terminal->cursor_x--;
-                } else if (terminal->cursor_y > 0) {
-                    terminal->cursor_y--;
-                    terminal->cursor_x = terminal->cols - 1;
-                }
-                
-                // Save current position
-                uint16_t saved_x = terminal->cursor_x;
-                uint16_t saved_y = terminal->cursor_y;
-                
-                // Write space and move forward
-                graphics_write_textr_char(' ');
-                
-                // Restore position
-                terminal->cursor_x = saved_x;
-                terminal->cursor_y = saved_y;
-            }
+            terminal_erase_last_char();
             break;
             
         case USB_KEY_TAB:
@@ -176,12 +269,17 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             // Clear input
             input_pos = 0;
             input_buffer[0] = '\0';
+            command_history_index = -1;
             graphics_write_textr("^C\n");
             terminalPrompt();
             break;
             
         case USB_KEY_UP:
+            terminal_history_up();
+            break;
         case USB_KEY_DOWN:
+            terminal_history_down();
+            break;
         case USB_KEY_LEFT:
         case USB_KEY_RIGHT:
         case USB_KEY_HOME:
@@ -252,6 +350,7 @@ void terminal_process_command(const char* cmd) {
      * submit another command against a launch that hasn't finished.
      */
     g_command_running = true;
+    g_prompt_waiting = true;
 
     uint64_t pid = command_execute_async(cmd);
     if (pid == 0) {
@@ -261,6 +360,7 @@ void terminal_process_command(const char* cmd) {
          * already printed any relevant message. Nothing to wait for.
          */
         g_command_running = false;
+        g_prompt_waiting = false;
         terminalPrompt();
         return;
     }
@@ -278,6 +378,15 @@ void terminal_process_command(const char* cmd) {
 
 void terminal_update(void) {
     while (1) {
+        terminal_poll_serial_input();
+
+        if (acpi_poll_power_button()) {
+            graphics_write_textr("ACPI power button pressed; shutting down.\n");
+            serial_write_str("ACPI: power-button shutdown requested\n");
+            if (!acpi_shutdown()) {
+                graphics_write_textr("ACPI shutdown failed.\n");
+            }
+        }
         
         // Process pending command
         if (command_ready) {
@@ -300,11 +409,16 @@ void terminal_update(void) {
         // bring the prompt back.
         if (g_command_running) {
             command_poll_running();
-            if (!command_is_running()) {
-                g_command_running = false;
-                graphics_write_textr("\n");
-                terminalPrompt();
-            }
+            if (!command_is_running()) g_command_running = false;
+        }
+
+        bool command_active = g_command_running || command_is_running() ||
+                              command_has_last_user_program();
+        if (!command_active && g_prompt_waiting) {
+            g_command_running = false;
+            g_prompt_waiting = false;
+            graphics_write_textr("\n");
+            terminalPrompt();
         }
 
         sleep(10);
@@ -391,54 +505,48 @@ void terminal_program_entry(void) {
     // Initialize keyboard
     terminal_init_keyboard();
     
-    // Start cursor updater process
-    serial_write_str("Terminal: Starting cursor process...\n");
-    process_t* cursor_process = createProcess("cursorupdater", cursorupdater);
-
-    if (vgaterm_ask_yn("Mount disk?", true)) {
-        vgaterm_print("Mounting disk...\n");
+    graphics_terminal_clear();
+    graphics_write_textr("MinimalOS startup\n\n");
+    if (kernel_boot_no_disk) {
+        graphics_write_textr("[STARTING] Disk mode disabled by boot option\n");
+        serial_write_str("Terminal: disk initialization skipped by boot option\n");
+    } else {
+        graphics_write_textr("[STARTING] Mounting disk\n");
         command_execute("initdisk");
-        minimafs_disk_device_t* device;
-        device = getminimadrive();
+        minimafs_disk_device_t* device = getminimadrive();
         if (!device) {
-            vgaterm_print("/cr255g0b0/No disk device found/cr255g255b255/\n");
+            vgaterm_print_error("No disk device found\n");
         } else {
             int success = mountdrive(device, 0);
             if (success == 1) {
-                vgaterm_print("Mount succeded.\n");
-                serial_write_str("Terminal: mountdrive returned; loading saved resolution...\n");
-                if (systeminfo_load_saved_resolution()) {
-                    vgaterm_print("Loaded saved display resolution.\n");
-                }
-                serial_write_str("Terminal: saved resolution step complete; initializing services...\n");
+                vgaterm_print_success("Disk mounted\n");
+                systeminfo_load_saved_resolution();
+                serial_write_str("Terminal: Starting service discovery...\n");
                 service_manager_init();
-                serial_write_str("Terminal: service initialization complete\n");
-            }else if (success == 2) {
-                vgaterm_print("/cr255g0b0/MinimaFS: Drive already mounted/cr255g255b255/\n");
-            }else if (success == 3) {
-                vgaterm_print("/cr255g0b0/MinimaFS: Failed to parse storage.desc/cr255g255b255/\n");
-            }else if (success == 4) {
-                vgaterm_print("/cr255g0b0/MinimaFS: Invalid root block/cr255g255b255/\n");
-            }else if (success == 5) {
-                vgaterm_print("/cr255g0b0/MinimaFS: Drive too large for bitmap/cr255g255b255/\n");
+                serial_write_str("Terminal: Service discovery complete\n");
+            } else if (success == 2) {
+                vgaterm_print_error("MinimaFS: Drive already mounted\n");
+            } else if (success == 3) {
+                vgaterm_print_error("MinimaFS: Failed to parse storage.desc\n");
+            } else if (success == 4) {
+                vgaterm_print_error("MinimaFS: Invalid root block\n");
+            } else if (success == 5) {
+                vgaterm_print_error("MinimaFS: Drive too large for bitmap\n");
             } else {
-                vgaterm_print("/cr255g0b0/Mount failed.\n");
+                vgaterm_print_error("Mount failed\n");
             }
-        minimafs_drive_t* d = get_drive(0);
-
-        if (!d) {
-            serial_write_str("Drive 0 = NULL\n");
-        } else if (!d->mounted) {
-            serial_write_str("Drive 0 not mounted\n");
-        } else {
-            vgaterm_print("Drive 0 OK\n");
-        }
         }
     }
+
+    // Start cursor updates only after startup drawing and resolution changes.
+    serial_write_str("Terminal: Starting cursor process...\n");
+    createProcess("cursorupdater", cursorupdater);
+
+    graphics_terminal_clear();
     
     // Display welcome message
     graphics_write_textr("========================================\n");
-    graphics_write_textr("  Welcome to MinimalOS Terminal!\n");
+    graphics_write_textr("  Welcome to the MinimalOS Terminal!\n");
     graphics_write_textr("========================================\n\n");
     
     graphics_write_textr("System: ");

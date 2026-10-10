@@ -1,8 +1,11 @@
 toolchain_home := $(if $(SUDO_USER),$(shell getent passwd $(SUDO_USER) | cut -d: -f6),$(HOME))
 CC := $(toolchain_home)/cross/bin/x86_64-elf-gcc
 LD := $(toolchain_home)/cross/bin/x86_64-elf-ld
+BUILD_DATE := $(shell date '+%Y-%m-%d %H:%M:%S')
+BUILD_DATE_CFLAG := '-DBUILD_DATE="$(BUILD_DATE)"'
 
 QEMU_NETDEV ?= user,id=net0
+QEMU_TWO_MCAST ?= 230.0.0.1:12345
 QEMU_AUDIO_DRIVER ?= none
 HOSTCC ?= gcc
 HOST_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -I src/intf
@@ -25,6 +28,27 @@ module_asm_object_files := $(patsubst src/modules/%.asm, build/modules/%.o, $(mo
 impl_c_source_files := $(shell find src/impl -name '*.c')
 impl_c_object_files := $(patsubst src/impl/%.c, build/impl/%.o, $(impl_c_source_files))
 
+minimassl_kernel_sources := \
+	Minimal-OS-SDK/libraries/minimaSSL/src/crypto.c \
+	Minimal-OS-SDK/libraries/minimaSSL/src/sha.c \
+	Minimal-OS-SDK/libraries/minimaSSL/src/tls_gcm.c
+minimassl_kernel_objects := $(patsubst Minimal-OS-SDK/libraries/minimaSSL/src/%.c, build/minimaSSL/%.o, $(minimassl_kernel_sources))
+minimassl_slib := dist/x86_64/minimaSSL.slib
+install1_source := src/resources/install1
+install1_mpkg := build/resources/install1.mpkg
+install1_object := build/resources/install1_mpkg.o
+install2_source := src/resources/install2
+install2_mpkg := build/resources/install2.mpkg
+install2_object := build/resources/install2_mpkg.o
+dlr_source_files := $(shell find Minimal-OS-SDK/programs/dlr -type f \( -name '*.c' -o -name '*.h' \))
+dlr_run := $(install2_source)/dlr.run
+dlrconnect_run := $(install2_source)/dlrconnect.run
+install3_source := src/resources/install3
+install3_mpkg := build/resources/install3.mpkg
+install3_object := build/resources/install3_mpkg.o
+install2_files := $(shell find $(install2_source) -type f 2>/dev/null)
+install3_files := $(shell find $(install3_source) -type f 2>/dev/null)
+
 impl_asm_source_files := $(filter-out src/impl/boot/ap_trampoline.asm, $(shell find src/impl -name '*.asm'))
 impl_asm_object_files := $(patsubst src/impl/%.asm, build/impl/%.o, $(impl_asm_source_files))
 
@@ -32,7 +56,8 @@ ap_trampoline_bin := build/impl/boot/ap_trampoline.bin
 ap_trampoline_object := build/impl/boot/ap_trampoline.o
 
 source_object_files := $(module_c_object_files) $(module_asm_object_files) \
-	$(impl_c_object_files) $(impl_asm_object_files) $(ap_trampoline_object)
+	$(impl_c_object_files) $(impl_asm_object_files) $(ap_trampoline_object) \
+	$(minimassl_kernel_objects) $(install1_object) $(install2_object) $(install3_object)
 
 audio_player_enabled := $(if $(filter 0,$(MODULE_Audio_audio_c)),,1)
 audio_wav_files := $(if $(audio_player_enabled),$(shell find src/resources -name '*.wav'),)
@@ -41,9 +66,12 @@ audio_obj_files_build := $(patsubst src/resources/%.wav, build/resources/%.o, $(
 audio_object_files := $(audio_obj_files_build) $(audio_obj_files_src)
 header_files := $(shell find src/intf -name '*.h')
 
+.PHONY: FORCE
+FORCE:
+
 build/modules/%.o: src/modules/%.c $(header_files)
 	mkdir -p $(dir $@)
-	$(CC) -c -I src/intf -ffreestanding $< -o $@
+	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -ffreestanding $< -o $@
 
 build/modules/%.o: src/modules/%.asm
 	mkdir -p $(dir $@)
@@ -51,7 +79,16 @@ build/modules/%.o: src/modules/%.asm
 
 build/impl/%.o: src/impl/%.c $(header_files)
 	mkdir -p $(dir $@)
-	$(CC) -c -I src/intf -ffreestanding $< -o $@
+	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -I Minimal-OS-SDK/libraries/minimaSSL/include -ffreestanding $< -o $@
+
+build/impl/kernel/main.o: FORCE
+
+build/minimaSSL/%.o: Minimal-OS-SDK/libraries/minimaSSL/src/%.c $(header_files)
+	mkdir -p $(dir $@)
+	$(CC) -c -I src/intf \
+		-I Minimal-OS-SDK/libraries/minimaSSL/include \
+		-I Minimal-OS-SDK/libraries/minimaSSL/src \
+		-ffreestanding -fno-builtin $< -o $@
 
 build/impl/%.o: src/impl/%.asm
 	mkdir -p $(dir $@)
@@ -71,8 +108,61 @@ build/resources/%.o: src/resources/%.wav
 	mkdir -p $(dir $@)
 	python3 tools/audioconverter/wavtoadi.py --format IADPCM --object-file $< $@
 
+.PHONY: minimaSSL-slib
+minimaSSL-slib: Minimal-OS-SDK/libraries/minimaSSL/src/crypto.c \
+	Minimal-OS-SDK/libraries/minimaSSL/src/evp.c \
+	Minimal-OS-SDK/libraries/minimaSSL/src/rand.c \
+	Minimal-OS-SDK/libraries/minimaSSL/src/sha.c \
+	Minimal-OS-SDK/libraries/minimaSSL/src/tls_gcm.c
+	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh --slib Minimal-OS-SDK/libraries/minimaSSL
+	mkdir -p $(dir $(minimassl_slib))
+	cp Minimal-OS-SDK/minimaSSL.slib $(minimassl_slib)
+
+$(install1_source)/minimaSSL.slib: minimaSSL-slib
+	mkdir -p $(install1_source)
+	cp $(minimassl_slib) $@
+
+$(install1_mpkg): $(install1_source)/minimaSSL.slib tools/mkpkg/mkpkg.py
+	mkdir -p $(dir $@)
+	python3 tools/mkpkg/mkpkg.py $(install1_source) $@ --store
+
+$(install1_object): $(install1_mpkg)
+	mkdir -p $(dir $@)
+	objcopy -I binary -O elf64-x86-64 -B i386 \
+		--redefine-sym _binary_build_resources_install1_mpkg_start=_binary_install1_mpkg_start \
+		--redefine-sym _binary_build_resources_install1_mpkg_end=_binary_install1_mpkg_end \
+		$< $@
+
+$(install2_mpkg): $(install2_source) $(install2_files) $(dlr_run) $(dlrconnect_run) tools/mkpkg/mkpkg.py
+	mkdir -p $(dir $@)
+	python3 tools/mkpkg/mkpkg.py $(install2_source) $@ --store
+
+$(dlr_run): $(dlr_source_files) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
+	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh Minimal-OS-SDK/programs/dlr
+
+$(dlrconnect_run): $(dlr_source_files) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
+	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh --worker Minimal-OS-SDK/programs/dlr
+
+$(install2_object): $(install2_mpkg)
+	mkdir -p $(dir $@)
+	objcopy -I binary -O elf64-x86-64 -B i386 \
+		--redefine-sym _binary_build_resources_install2_mpkg_start=_binary_install2_mpkg_start \
+		--redefine-sym _binary_build_resources_install2_mpkg_end=_binary_install2_mpkg_end \
+		$< $@
+
+$(install3_mpkg): $(install3_source) $(install3_files) tools/mkpkg/mkpkg.py
+	mkdir -p $(dir $@)
+	python3 tools/mkpkg/mkpkg.py $(install3_source) $@ --store
+
+$(install3_object): $(install3_mpkg)
+	mkdir -p $(dir $@)
+	objcopy -I binary -O elf64-x86-64 -B i386 \
+		--redefine-sym _binary_build_resources_install3_mpkg_start=_binary_install3_mpkg_start \
+		--redefine-sym _binary_build_resources_install3_mpkg_end=_binary_install3_mpkg_end \
+		$< $@
+
 .PHONY: build-x86_64
-build-x86_64: $(source_object_files) $(audio_object_files) 
+build-x86_64: minimaSSL-slib $(source_object_files) $(audio_object_files)
 	mkdir -p dist/x86_64
 	$(LD) -o dist/x86_64/kernel.bin -T targets/x86_64/linker.ld $(source_object_files) $(audio_object_files)
 	cp dist/x86_64/kernel.bin targets/x86_64/iso/boot/kernel.bin
@@ -80,7 +170,9 @@ build-x86_64: $(source_object_files) $(audio_object_files)
 
 .PHONY: clean
 clean:
-	rm -rf build dist
+	rm -rf build dist Minimal-OS-SDK/build
+	find . -type f -name '*.run' -delete
+	rm -f Minimal-OS-SDK/minimaSSL.slib src/resources/install1/minimaSSL.slib
 
 .PHONY: audio
 audio: $(audio_obj_files_build) $(audio_obj_files_src)
@@ -91,6 +183,17 @@ src/resources/%.o: src/resources/%.wav
 .PHONY: run
 run: build-x86_64
 	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+
+.PHONY: run-two
+run-two: build-x86_64
+	@test -f sata256.img || { echo "run-two: missing sata256.img" >&2; exit 1; }
+	@test -f sata256-2.img || cp sata256.img sata256-2.img
+	@echo "run-two: starting two MOS guests on multicast LAN $(QEMU_TWO_MCAST)"
+	@echo "run-two: addresses are automatic: 192.168.100.2 and 192.168.100.3"
+	@trap 'kill $$qemu1 $$qemu2 2>/dev/null || true; wait $$qemu1 $$qemu2 2>/dev/null || true' INT TERM EXIT; \
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu-one.log -serial tcp:127.0.0.1:5566,server=on,wait=off -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker1 -machine pcspk-audiodev=speaker1 -device ahci,id=ahci1 -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci1.0 -netdev socket,id=net-one,mcast=$(QEMU_TWO_MCAST) -device rtl8139,netdev=net-one,mac=52:54:00:12:34:56 & qemu1=$$!; \
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu-two.log -serial tcp:127.0.0.1:5567,server=on,wait=off -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker2 -machine pcspk-audiodev=speaker2 -device ahci,id=ahci2 -drive id=disk1,file=sata256-2.img,if=none,format=raw -device ide-hd,drive=disk1,bus=ahci2.0 -netdev socket,id=net-two,mcast=$(QEMU_TWO_MCAST) -device rtl8139,netdev=net-two,mac=52:54:00:12:34:57 & qemu2=$$!; \
+	wait $$qemu1 $$qemu2
 
 .PHONY: run-audio
 run-audio: build-x86_64
@@ -135,3 +238,7 @@ build/tests/host/gfx_blit_tests: tests/host/gfx_blit_tests.c src/impl/handlers/g
 .PHONY: ci-interact
 ci-interact:
 	bash tools/debug/ci_interact.sh
+
+.PHONY: dlr-cli-test
+dlr-cli-test:
+	bash tools/debug/test_dlr_present.sh

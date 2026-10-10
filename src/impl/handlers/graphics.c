@@ -251,8 +251,8 @@ void graphics_terminal_putchar(char c, uint32_t col, uint32_t row, color_t fg, c
     uint32_t px = col * g_terminal.char_width;
     uint32_t py = row * g_terminal.char_height;
     if (px >= g_gpu->width || py >= g_gpu->height) return;
-    uint32_t fg_pixel = graphics_color_to_u32(fg);
-    uint32_t bg_pixel = graphics_color_to_u32(bg);
+    uint32_t fg_pixel = gpu_pack_color(g_gpu, graphics_color_to_u32(fg));
+    uint32_t bg_pixel = gpu_pack_color(g_gpu, graphics_color_to_u32(bg));
 
     for (uint32_t y = 0; y < 8 && y < g_terminal.char_height; y++) {
         uint8_t row_data = font8x8_basic[char_index][y];
@@ -298,6 +298,13 @@ void erase_cursor(int cx, int cy) {
     );
 }
 
+static void invalidate_cursor(void) {
+    if (last_x == -1 || last_y == -1) return;
+    erase_cursor(last_x, last_y);
+    last_x = -1;
+    last_y = -1;
+}
+
 void terminalUpdateCursor() {
     // Erase old cursor
     if (last_x != -1 && last_y != -1) {
@@ -328,9 +335,10 @@ void terminalUpdateCursor() {
 // Terminal Functions
 // ===========================================
 
-void graphics_set_resolution(uint32_t cols, uint32_t rows) {
+static void graphics_set_resolution_internal(uint32_t cols, uint32_t rows,
+                                             bool report) {
     if (!g_gpu) {
-        serial_write_str("graphics_set_resolution: GPU not initialized\n");
+        if (report) serial_write_str("graphics_set_resolution: GPU not initialized\n");
         return;
     }
 
@@ -359,16 +367,25 @@ void graphics_set_resolution(uint32_t cols, uint32_t rows) {
     g_terminal.bg_color = COLOR_BLACK;
     g_terminal.cursor_visible = true;
 
-    serial_write_str("Terminal resolution set to ");
-    serial_write_dec(cols);
-    serial_write_str("x");
-    serial_write_dec(rows);
-    serial_write_str(" (8x8 pixels per char, max ");
-    serial_write_dec(max_cols);
-    serial_write_str("x");
-    serial_write_dec(max_rows);
-    serial_write_str(")\n");
+    if (report) {
+        serial_write_str("Terminal resolution set to ");
+        serial_write_dec(cols);
+        serial_write_str("x");
+        serial_write_dec(rows);
+        serial_write_str(" (8x8 pixels per char, max ");
+        serial_write_dec(max_cols);
+        serial_write_str("x");
+        serial_write_dec(max_rows);
+        serial_write_str(")\n");
+    }
+}
 
+void graphics_set_resolution(uint32_t cols, uint32_t rows) {
+    graphics_set_resolution_internal(cols, rows, true);
+}
+
+void graphics_set_resolution_quiet(uint32_t cols, uint32_t rows) {
+    graphics_set_resolution_internal(cols, rows, false);
 }
 
 terminal_t* graphics_get_terminal(void) {
@@ -376,6 +393,7 @@ terminal_t* graphics_get_terminal(void) {
 }
 
 void graphics_terminal_clear(void) {
+    invalidate_cursor();
     graphics_clear_c(g_terminal.bg_color);
     g_terminal.cursor_x = 0;
     g_terminal.cursor_y = 0;
@@ -388,6 +406,7 @@ void graphics_terminal_clear(void) {
 void graphics_terminal_redraw(void) {
     if (!g_gpu || !g_gpu->fb) return;
 
+    invalidate_cursor();
     graphics_clear_c(g_terminal.bg_color);
     for (uint32_t row = 0; row < g_terminal.rows && row < TERM_MAX_ROWS; row++) {
         for (uint32_t col = 0; col < g_terminal.cols && col < TERM_MAX_COLS; col++) {
@@ -400,6 +419,7 @@ void graphics_terminal_redraw(void) {
 }
 
 void graphics_terminal_newline(void) {
+    invalidate_cursor();
     g_terminal.cursor_x = 0;
     g_terminal.cursor_y++;
     
@@ -411,6 +431,7 @@ void graphics_terminal_newline(void) {
 void graphics_terminal_scroll(void) {
     if (!g_gpu) return;
 
+    invalidate_cursor();
     uint32_t rows = g_terminal.rows;
     uint32_t cols = g_terminal.cols;
 
@@ -444,10 +465,10 @@ void graphics_terminal_scroll(void) {
         }
     }
 
-    uint32_t background = 0xFF000000 |
+    uint32_t background = gpu_pack_color(g_gpu, 0xFF000000 |
         ((uint32_t)g_terminal.bg_color.r << 16) |
         ((uint32_t)g_terminal.bg_color.g << 8) |
-        g_terminal.bg_color.b;
+        g_terminal.bg_color.b);
     for (uint32_t y = pixel_height - g_terminal.char_height; y < pixel_height; y++) {
         volatile uint32_t* row = framebuffer +
             (y * pitch) / sizeof(uint32_t);
@@ -460,6 +481,7 @@ void graphics_terminal_scroll(void) {
 }
 
 void graphics_terminal_set_cursor(uint32_t x, uint32_t y) {
+    invalidate_cursor();
     g_terminal.cursor_x = MIN(x, g_terminal.cols - 1);
     g_terminal.cursor_y = MIN(y, g_terminal.rows - 1);
 }
@@ -475,6 +497,8 @@ void graphics_terminal_set_color(color_t fg, color_t bg) {
 }
 
 void graphics_write_textr_char(char c) {
+    invalidate_cursor();
+
     if (c == '\n') {
         graphics_terminal_newline();
         return;

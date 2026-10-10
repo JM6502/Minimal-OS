@@ -7,7 +7,7 @@
 #include <stdbool.h>
 
 #define MAX_PROCESS_NAME_LEN 128
-#define STACK_SIZE 0x10000  // 64 KB
+#define STACK_SIZE 0x4000   // 16 KB
 
 // Process states
 typedef enum {
@@ -39,6 +39,8 @@ typedef enum {
     PROC_PRIVILEGE_KERNEL = 0,   // Kernel-owned process (drivers, terminal, etc)
     PROC_PRIVILEGE_USER   = 1,   // A loaded .run program (see runcommand.c)
 } process_privilege_t;
+
+struct user_heap_allocation;
 
 // Process control block
 typedef struct process {
@@ -101,6 +103,8 @@ typedef struct process {
     size_t user_image_pages;
     void* user_stack_phys;
     size_t user_stack_pages;
+    bool kernel_stack_page_backed;
+    size_t kernel_stack_pages;
     // argv/argc for a user process's entry point, consumed by
     // proc_enter_ring3() via proc_trampoline(). Set by run_launch_file()
     // (runcommand.c) before the process is first scheduled. Safe to
@@ -116,6 +120,10 @@ typedef struct process {
     uint64_t cleanup_deadline_ms;
     bool cleanup_requested;
     bool cleanup_invoked;
+    struct user_heap_allocation* user_heap_allocations;
+    uint8_t exit_code;
+    bool crashed;
+    uint8_t crash_vector;
 } process_t;
 
 // Global process list head (defined in proc.c)
@@ -148,6 +156,16 @@ uint64_t get_kernel_pml4(void);
 // Copy a user range to process-owned physical pages and map only those pages
 // as user-accessible in the process's private page-table hierarchy.
 int proc_map_user_range(process_t* proc, void* address, size_t length);
+int proc_map_user_range_at(process_t* proc, const void* source,
+                           void* user_address, size_t length);
+int proc_map_user_heap_range(process_t* proc, void* address, size_t length);
+int proc_unmap_user_heap_range(process_t* proc, void* address, size_t length);
+int proc_user_heap_track(process_t* proc, void* address, size_t size);
+int proc_user_heap_contains(process_t* proc, void* address);
+int proc_user_heap_untrack(process_t* proc, void* address);
+int proc_user_heap_resize(process_t* proc, void* old_address,
+                          void* new_address, size_t new_size);
+void proc_user_heap_cleanup(process_t* proc);
 void proc_destroy_address_space(process_t* proc);
 
 // Helper functions (from string.h but needed here)

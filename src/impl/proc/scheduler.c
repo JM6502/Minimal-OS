@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/commandhandler.h"
+#include "x86_64/gdt.h"
 #include "time.h"
 #include "panic.h"
 #include "print.h"
@@ -135,6 +137,15 @@ void scheduler_enqueue_new(process_t* proc) {
     proc->sched_level = SCHED_LEVEL_INTERACTIVE;
     proc->sched_ticks_used = 0;
     proc->sched_cpu = pick_least_loaded_cpu();
+    if (proc->privilege == PROC_PRIVILEGE_USER) {
+        serial_write_str("SCHED: enqueue user pid=");
+        serial_write_dec(proc->pid);
+        serial_write_str(" cpu=");
+        serial_write_dec(proc->sched_cpu);
+        serial_write_str(" state=");
+        serial_write_dec(proc->state);
+        serial_write_str("\n");
+    }
 
     percpu_runqueue_t* rq = &g_runqueues[proc->sched_cpu];
     uint64_t flags = spinlock_acquire(&rq->lock);
@@ -461,8 +472,13 @@ void schedule() {
 
             if (to_free->kernel_stack) {
                 void* stack_base = (void*)((uint8_t*)to_free->kernel_stack - STACK_SIZE);
-                free_mem(stack_base);
+                if (to_free->kernel_stack_page_backed)
+                    free_pages(stack_base, to_free->kernel_stack_pages);
+                else
+                    free_mem(stack_base);
             }
+
+                    proc_user_heap_cleanup(to_free);
 
             if (to_free->user_image_phys) {
                 free_pages(to_free->user_image_phys, to_free->user_image_pages);
@@ -540,6 +556,15 @@ void schedule() {
     next->sched_ticks_used = 0;
     next->state = PROCESS_RUNNING;
     current_process = next;
+    tss_entry_t* tss = gdt_get_tss(cpu_id);
+    if (tss && next->kernel_stack) {
+        tss->rsp0 = (uint64_t)(uintptr_t)next->kernel_stack;
+    }
+    if (next->privilege == PROC_PRIVILEGE_USER) {
+        serial_write_str("SCHED: dispatch user pid=");
+        serial_write_dec(next->pid);
+        serial_write_str("\n");
+    }
 
     if (!old) {
         // First process this core has ever run - nothing to save,
@@ -745,15 +770,22 @@ void scheduler_print_stats() {
     print_str("\n============================\n");
 }
 
-void process_exit(void) {
+void process_exit_with_status(uint8_t exit_code, bool crashed,
+                              uint8_t crash_vector) {
     if (!current_process) {
         PANIC("process_exit() called with no current process");
     }
+
+    current_process->exit_code = exit_code;
+    current_process->crashed = crashed;
+    current_process->crash_vector = crash_vector;
 
     serial_write_str("[PROC] Exiting process: ");
     serial_write_str(current_process->name);
     serial_write_str("\n");
 
+    command_user_process_exited(current_process->pid, exit_code, crashed,
+                                crash_vector);
     current_process->state = PROCESS_TERMINATED;
     schedule();
 
@@ -762,4 +794,8 @@ void process_exit(void) {
     for (;;) {
         asm volatile("sti; hlt" ::: "memory");
     }
+}
+
+void process_exit(void) {
+    process_exit_with_status(0, false, 0);
 }
