@@ -36,6 +36,25 @@ static const char* syscall_resolve_path(const char* input, char* resolved) {
     return resolved;
 }
 
+static bool user_range_ok(const void* ptr, size_t len, bool write) {
+    (void)write;
+    if (!ptr || len == 0) return false;
+
+    uintptr_t addr = (uintptr_t)ptr;
+    if (addr < 0x1000ULL) return false;
+
+    if (len > SIZE_MAX - addr) return false;
+    if (addr > UINTPTR_MAX - len) return false;
+
+    if (current_process && current_process->privilege == PROC_PRIVILEGE_USER) {
+        if (!proc_user_heap_contains(current_process, (void*)ptr)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     if (!buf) return SYS_ERR_INVAL;
     if (fd != 1 && fd != 2) return SYS_ERR_BADFD;
@@ -59,11 +78,41 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
     if (!request) return SYS_ERR_INVAL;
 
     const int64_t* a = request->args;
+    const bool requires_screen_owner =
+        request->op == SYS_GRAPHICS_CLEAR ||
+        request->op == SYS_GRAPHICS_PIXEL ||
+        request->op == SYS_GRAPHICS_LINE ||
+        request->op == SYS_GRAPHICS_CIRCLE ||
+        request->op == SYS_GRAPHICS_FILL_CIRCLE ||
+        request->op == SYS_GRAPHICS_RECTANGLE ||
+        request->op == SYS_GRAPHICS_FILL_RECTANGLE ||
+        request->op == SYS_GRAPHICS_TRIANGLE ||
+        request->op == SYS_GRAPHICS_FILL_TRIANGLE ||
+        request->op == SYS_GRAPHICS_ELLIPSE ||
+        request->op == SYS_GRAPHICS_TEXT ||
+        request->op == SYS_GRAPHICS_SET_RESOLUTION ||
+        request->op == SYS_GRAPHICS_TERMINAL_CLEAR;
+
+    if (requires_screen_owner &&
+        (!graphics_has_screen_owner() || graphics_screen_owner_pid() != getCurrentPID())) {
+        return SYS_ERR_PERM;
+    }
+
     switch (request->op) {
         case SYS_GRAPHICS_GET_WIDTH:
             return graphics_get_width();
         case SYS_GRAPHICS_GET_HEIGHT:
             return graphics_get_height();
+        case SYS_GRAPHICS_ACQUIRE:
+            return graphics_claim_screen() ? SYS_SUCCESS : SYS_ERR_PERM;
+        case SYS_GRAPHICS_RELEASE:
+            if (graphics_release_screen()) {
+                graphics_terminal_redraw();
+                return SYS_SUCCESS;
+            }
+            return SYS_ERR_PERM;
+        case SYS_GRAPHICS_OWNER:
+            return graphics_has_screen_owner() ? graphics_screen_owner_pid() : SYS_ERR_NOTFOUND;
         case SYS_GRAPHICS_CLEAR:
             graphics_clear((uint8_t)a[0], (uint8_t)a[1], (uint8_t)a[2]);
             return SYS_SUCCESS;
@@ -597,6 +646,23 @@ static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc
 
 static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* regs) {
     switch (syscall_num) {
+        case SYS_GRAPHICS: {
+            const syscall_graphics_request_t* req =
+                (const syscall_graphics_request_t*)regs->rdi;
+            if (!req) return true;
+            switch (req->op) {
+                case SYS_GRAPHICS_GET_WIDTH:
+                case SYS_GRAPHICS_GET_HEIGHT:
+                case SYS_GRAPHICS_OWNER:
+                    return true;
+                case SYS_GRAPHICS_ACQUIRE:
+                case SYS_GRAPHICS_RELEASE:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         case SYS_MANAGER: {
             // arg layout matches mos_manager(manager, operation, value)
             // -> mos_syscall3(SYS_MANAGER, manager, operation, value)

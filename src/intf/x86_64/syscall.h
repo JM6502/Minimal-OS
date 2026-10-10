@@ -119,6 +119,9 @@ typedef enum {
     SYS_GRAPHICS_MEASURE_TEXT,
     SYS_GRAPHICS_SET_RESOLUTION,
     SYS_GRAPHICS_TERMINAL_CLEAR,
+    SYS_GRAPHICS_ACQUIRE,
+    SYS_GRAPHICS_RELEASE,
+    SYS_GRAPHICS_OWNER,
 } syscall_graphics_op_t;
 
 typedef struct {

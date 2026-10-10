@@ -1,5 +1,6 @@
 #include "usb/usb_stack.h"
 #include "usb/uhci.h"
+#include "usb/ohci.h"
 #include "keyboard/usbkeyboard.h"
 #include "x86_64/pci.h"
 #include "x86_64/port.h"
@@ -415,6 +416,11 @@ bool uhci_init(pci_device_t* dev) {
 // ===========================================
 
 static void uhci_reset_port(uint8_t port) {
+    if (g_usb_hc.type == USB_HC_TYPE_OHCI) {
+        ohci_reset_port(port);
+        return;
+    }
+
     uint16_t port_reg = (port == 0) ? UHCI_PORTSC1 : UHCI_PORTSC2;
 
     serial_write_str("UHCI: Resetting port ");
@@ -512,6 +518,22 @@ static void uhci_activate_queue(uhci_qh_t* qh) {
 // REPLACE uhci_control_transfer with this version:
 bool uhci_control_transfer(uint8_t dev_addr, usb_setup_packet_t* setup, 
                            void* data, uint16_t length) {
+    if (g_usb_hc.type == USB_HC_TYPE_OHCI) {
+        uint8_t max_packet = 8;
+        bool low_speed = false;
+        for (uint8_t i = 0; i < 8; i++) {
+            usb_device_t* dev = &g_usb_hc.devices[i];
+            if (dev->state != USB_DEVICE_STATE_DETACHED &&
+                dev->address == dev_addr) {
+                if (dev->max_packet_size) max_packet = dev->max_packet_size;
+                low_speed = dev->low_speed;
+                break;
+            }
+        }
+        return ohci_control_transfer(dev_addr, setup, data, length,
+                                     max_packet, low_speed);
+    }
+
     serial_write_str("UHCI: Control transfer to device ");
     serial_write_dec(dev_addr);
     serial_write_str(", length=");
@@ -798,7 +820,22 @@ bool usb_init(void) {
                     return true;
                 }
             } else if (dev->prog_if == 0x10) {
-                serial_write_str("USB: Type: OHCI (USB 1.1) - not yet supported\n");
+                serial_write_str("USB: Type: OHCI (USB 1.1)\n");
+                if (ohci_init(dev)) {
+                    g_usb_hc.type = USB_HC_TYPE_OHCI;
+                    g_usb_hc.mmio_base = dev->bar[0] & ~0xFULL;
+                    g_usb_hc.num_ports = ohci_get_port_count();
+                    g_usb_hc.initialized = true;
+                    g_usb_initialized = true;
+                    found_controller = true;
+
+                    usb_enumerate_devices();
+                    usb_device_t* kbd = usb_get_keyboard();
+                    if (kbd) ohci_keyboard_interrupt_init(kbd);
+                    usb_device_t* mouse = usb_get_mouse();
+                    if (mouse) ohci_mouse_interrupt_init(mouse);
+                    return true;
+                }
             } else if (dev->prog_if == 0x20) {
                 serial_write_str("USB: Type: EHCI (USB 2.0) - not yet supported\n");
             } else if (dev->prog_if == 0x30) {
@@ -938,6 +975,11 @@ bool uhci_interrupt_transfer(uint8_t dev_addr, uint8_t endpoint, void* buffer, u
 // ===========================================
 
 void uhci_keyboard_interrupt_init(usb_device_t* dev) {
+    if (g_usb_hc.type == USB_HC_TYPE_OHCI) {
+        ohci_keyboard_interrupt_init(dev);
+        return;
+    }
+
     serial_write_str("UHCI: Setting up persistent keyboard interrupt TD\n");
     
     keyboard_int_td = uhci_alloc_td();
@@ -1116,6 +1158,15 @@ bool uhci_keyboard_interrupt_poll(uint8_t* buffer, uint16_t length) {
  
 void usb_poll_keyboard(usb_device_t* dev) {
     static uint8_t report_buffer[8];
+
+    if (g_usb_hc.type == USB_HC_TYPE_OHCI) {
+        if (ohci_keyboard_interrupt_poll(report_buffer, sizeof(report_buffer))) {
+            usb_hid_keyboard_report_t* report =
+                (usb_hid_keyboard_report_t*)report_buffer;
+            usb_keyboard_process_report(report);
+        }
+        return;
+    }
     
     // Poll the persistent TD
     if (uhci_keyboard_interrupt_poll(report_buffer, 8)) {
@@ -1156,6 +1207,11 @@ void usb_init_keyboard_polling(usb_device_t* dev) {
 // present, the mouse TD self-loops and is the sole entry, same pattern
 // as the keyboard-only case.
 void uhci_mouse_interrupt_init(usb_device_t* dev) {
+    if (g_usb_hc.type == USB_HC_TYPE_OHCI) {
+        ohci_mouse_interrupt_init(dev);
+        return;
+    }
+
     serial_write_str("UHCI: Setting up persistent mouse interrupt TD\n");
 
     mouse_int_td = uhci_alloc_td();
@@ -1271,6 +1327,15 @@ static bool uhci_mouse_interrupt_poll(uint8_t* buffer, uint16_t length) {
 void usb_poll_mouse(usb_device_t* dev) {
     static uint8_t report_buffer[8];
 
+    if (g_usb_hc.type == USB_HC_TYPE_OHCI) {
+        if (ohci_mouse_interrupt_poll(report_buffer, sizeof(report_buffer))) {
+            usb_hid_mouse_report_t* report =
+                (usb_hid_mouse_report_t*)report_buffer;
+            usb_mouse_process_report(report);
+        }
+        return;
+    }
+
     if (uhci_mouse_interrupt_poll(report_buffer, 8)) {
         usb_hid_mouse_report_t* report = (usb_hid_mouse_report_t*)report_buffer;
         usb_mouse_process_report(report);
@@ -1295,10 +1360,20 @@ void usb_enumerate_devices(void) {
     
     serial_write_str("USB: Enumerating devices...\n");
     
-    // Check both ports
-    for (uint8_t port = 0; port < 2; port++) {
+    uint8_t port_count = g_usb_hc.type == USB_HC_TYPE_OHCI
+        ? ohci_get_port_count() : 2;
+    for (uint8_t port = 0; port < port_count; port++) {
         uint16_t port_reg = (port == 0) ? UHCI_PORTSC1 : UHCI_PORTSC2;
-        uint16_t port_status = uhci_read16(port_reg);
+        uint32_t port_status;
+        if (g_usb_hc.type == USB_HC_TYPE_OHCI) {
+            uint32_t ohci_status = ohci_get_port_status(port);
+            port_status = (ohci_status & OHCI_PORT_STATUS_CONNECTED)
+                ? UHCI_PORT_CCS : 0;
+            if (ohci_status & OHCI_PORT_STATUS_LOW_SPEED)
+                port_status |= UHCI_PORT_LSDA;
+        } else {
+            port_status = uhci_read16(port_reg);
+        }
         
         serial_write_str("USB: Port ");
         serial_write_dec(port);
@@ -1356,6 +1431,9 @@ bool usb_enumerate_device(uint8_t port, bool low_speed) {
     dev->port = port;
     dev->address = 0;  // Default address
     dev->state = USB_DEVICE_STATE_DEFAULT;
+    dev->max_packet_size = 8;
+    dev->low_speed = low_speed;
+    dev->full_speed = !low_speed;
     
     // Step 1: Get first 8 bytes of device descriptor (to get max packet size)
     serial_write_str("USB: Getting device descriptor (8 bytes)\n");
@@ -1373,6 +1451,10 @@ bool usb_enumerate_device(uint8_t port, bool low_speed) {
         serial_write_str("USB: Failed to get device descriptor\n");
         return false;
     }
+
+    dev->max_packet_size = desc.bMaxPacketSize0;
+    dev->low_speed = low_speed;
+    dev->full_speed = !low_speed;
     
     serial_write_str("USB: Max packet size: ");
     serial_write_dec(desc.bMaxPacketSize0);

@@ -1,4 +1,5 @@
 #include "graphics.h"
+#include "prochandler.h"
 #include "x86_64/gpu.h"
 #include "x86_64/allocator.h"
 #include "panic.h"
@@ -13,9 +14,39 @@ static gpu_device_t* g_gpu = NULL;
 bool graphics_safety_mode = true;
 static terminal_t g_terminal = {0};
 static font_t g_current_font = {0};
+static uint64_t g_screen_owner_pid = UINT64_MAX;
 
 static int last_x = -1;
 static int last_y = -1;
+
+bool graphics_claim_screen(void) {
+    const uint64_t pid = getCurrentPID();
+    if (g_screen_owner_pid == UINT64_MAX || g_screen_owner_pid == pid) {
+        g_screen_owner_pid = pid;
+        return true;
+    }
+    return false;
+}
+
+bool graphics_release_screen(void) {
+    const uint64_t pid = getCurrentPID();
+    if (g_screen_owner_pid == UINT64_MAX) {
+        return true;
+    }
+    if (g_screen_owner_pid == pid) {
+        g_screen_owner_pid = UINT64_MAX;
+        return true;
+    }
+    return false;
+}
+
+bool graphics_has_screen_owner(void) {
+    return g_screen_owner_pid != UINT64_MAX;
+}
+
+uint64_t graphics_screen_owner_pid(void) {
+    return g_screen_owner_pid;
+}
 
 // ===========================================
 // Terminal character buffer for scroll support

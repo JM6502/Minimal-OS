@@ -52,9 +52,10 @@ clear operations.
 
 ## USB
 
-The UHCI path initializes the controller, builds frame lists and transfer
- descriptors, enumerates devices, and detects HID boot keyboards. USB manager
-code registers the controller driver and exposes keyboard state to the terminal.
+The USB host path supports UHCI and OHCI controllers, initializes their frame
+schedules, enumerates directly attached devices, and detects HID boot keyboards
+and mice. USB manager code registers the controller driver and exposes keyboard
+state to the terminal. USB hubs and EHCI/XHCI controllers are not yet supported.
 
 User programs use `SYS_USB` wrappers for initialization, polling, keyboard
 presence, key translation, and keyboard metadata. USB polling is intentionally

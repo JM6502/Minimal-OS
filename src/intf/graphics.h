@@ -146,6 +146,12 @@ void graphics_set_font_style(font_style_t style);
 // Set text spacing
 void graphics_set_text_spacing(uint32_t letter_spacing, uint32_t line_spacing);
 
+// Single screen owner (first process to acquire gets exclusive drawing rights).
+bool graphics_claim_screen(void);
+bool graphics_release_screen(void);
+bool graphics_has_screen_owner(void);
+uint64_t graphics_screen_owner_pid(void);
+
 // Write text at position (supports \n, \t, \r)
 void graphics_write_text(const char* text, int32_t x, int32_t y, uint8_t r, uint8_t g, uint8_t b);
 void graphics_write_text_c(const char* text, int32_t x, int32_t y, color_t color);

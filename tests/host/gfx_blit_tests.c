@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,9 +50,36 @@ static void test_fill_and_blit(void) {
     assert(alpha_dst[0] != 0xFFFF0000u);
 }
 
+static void test_hostile_clip_and_alpha(void) {
+    gfx_rect_t a = { INT32_MIN, 0, 4, 2 };
+    gfx_rect_t b = { INT32_MIN + 1, 0, 4, 2 };
+    gfx_rect_t out = { 0, 0, 0, 0 };
+    assert(gfx_clip_rect(&a, &b, &out));
+    assert(out.x == INT32_MIN + 1);
+    assert(out.w == 3);
+
+    uint32_t fill_dst[4 * 4] = { 0 };
+    gfx_rect_t hostile_fill = { INT32_MIN, INT32_MIN, 10, 10 };
+    gfx_fill(fill_dst, 4, 4, 4, &hostile_fill, 0x11223344u);
+    assert(fill_dst[0] == 0u);
+
+    uint32_t alpha_dst[4] = { 0xFF000000u, 0xFF000000u, 0xFF000000u, 0xFF000000u };
+    uint32_t alpha_src[4] = { 0x00000000u, 0xFFFFFFFFu, 0x80000000u, 0x80008080u };
+    gfx_blit_alpha(alpha_dst, 2, 2, 2, alpha_src, 2, 2, 0, 0, 2, 2, -1, 0, 2, 2);
+    assert(alpha_dst[0] == 0xFFFFFFFFu);
+    assert(alpha_dst[1] == 0xFF000000u);
+
+    uint32_t alpha_dst2[2] = { 0x00000000u, 0x00000000u };
+    uint32_t alpha_src2[2] = { 0xFFFFFFFFu, 0x00000000u };
+    gfx_blit_alpha(alpha_dst2, 2, 1, 2, alpha_src2, 2, 1, 0, 0, 2, 1, 0, 0, 2, 1);
+    assert(alpha_dst2[0] == 0xFFFFFFFFu);
+    assert(alpha_dst2[1] == 0x00000000u);
+}
+
 int main(void) {
     test_clip_rect();
     test_fill_and_blit();
+    test_hostile_clip_and_alpha();
     puts("gfx_blit_tests: PASS");
     return 0;
 }
