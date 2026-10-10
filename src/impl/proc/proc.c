@@ -232,6 +232,40 @@ int proc_user_heap_contains(process_t* proc, void* address) {
 	return 0;
 }
 
+int proc_user_heap_contains_range(process_t* proc, const void* address,
+				  size_t length) {
+	if (!proc || !address || !length) return 0;
+	uintptr_t start = (uintptr_t)address;
+	if (length > UINTPTR_MAX - start) return 0;
+	uintptr_t end = start + length;
+	for (struct user_heap_allocation* item = proc->user_heap_allocations;
+	     item; item = item->next) {
+		uintptr_t allocation_start = (uintptr_t)item->address;
+		if (item->size > UINTPTR_MAX - allocation_start) continue;
+		uintptr_t allocation_end = allocation_start + item->size;
+		if (start >= allocation_start && end <= allocation_end) return 1;
+	}
+	return 0;
+}
+
+int proc_user_range_contains(process_t* proc, const void* address,
+			     size_t length) {
+	if (proc_user_heap_contains_range(proc, address, length)) return 1;
+	if (!proc || !address || !length) return 0;
+	uintptr_t start = (uintptr_t)address;
+	if (length > UINTPTR_MAX - start) return 0;
+	uintptr_t end = start + length;
+	if (proc->user_image_size && proc->user_image_size <=
+	    UINTPTR_MAX - proc->user_image_address &&
+	    start >= proc->user_image_address &&
+	    end <= proc->user_image_address + proc->user_image_size) return 1;
+	if (proc->user_stack_size && proc->user_stack_size <=
+	    UINTPTR_MAX - proc->user_stack_address &&
+	    start >= proc->user_stack_address &&
+	    end <= proc->user_stack_address + proc->user_stack_size) return 1;
+	return 0;
+}
+
 int proc_user_heap_track(process_t* proc, void* address, size_t size) {
 	if (!proc || !proc_user_heap_valid_range(address, size) ||
 	    proc_user_heap_contains(proc, address)) return 0;
@@ -326,9 +360,13 @@ int proc_map_user_range_at(process_t* proc, const void* source,
 	if (!proc->user_image_phys) {
 		proc->user_image_phys = physical;
 		proc->user_image_pages = pages;
+		proc->user_image_address = destination;
+		proc->user_image_size = length;
 	} else if (!proc->user_stack_phys) {
 		proc->user_stack_phys = physical;
 		proc->user_stack_pages = pages;
+		proc->user_stack_address = destination;
+		proc->user_stack_size = length;
 	} else {
 		free_pages(physical, pages);
 		return 0;

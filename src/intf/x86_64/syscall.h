@@ -78,6 +78,7 @@
 // (e.g. "bin"); both default sensibly when NULL.
 #define SYS_CREATE        34
 #define SYS_GETCWD        35
+#define SYS_INPUT_READ    36
 
 #define SYS_O_RDONLY 0
 // Anything non-zero opens writable; SYS_OPEN maps flags==SYS_O_RDONLY
@@ -122,7 +123,88 @@ typedef enum {
     SYS_GRAPHICS_ACQUIRE,
     SYS_GRAPHICS_RELEASE,
     SYS_GRAPHICS_OWNER,
+    SYS_GRAPHICS_BLIT,
+    SYS_GRAPHICS_PRESENT,
+    SYS_GRAPHICS_INFO,
 } syscall_graphics_op_t;
+
+#define SYS_GRAPHICS_ABI_VERSION 1u
+#define SYS_GRAPHICS_BLIT_OPAQUE 1u
+#define SYS_GRAPHICS_BLIT_ALPHA 2u
+#define SYS_GRAPHICS_PIXEL_FORMAT_ARGB8888 1u
+#define SYSCALL_GFX_MAX_DIMENSION 16384u
+#define SYSCALL_GFX_MAX_BUFFER_BYTES (64u * 1024u * 1024u)
+
+#define SYS_INPUT_ABI_VERSION 1u
+#define SYSCALL_INPUT_KEY_DOWN 1u
+#define SYSCALL_INPUT_KEY_UP 2u
+#define SYSCALL_INPUT_MOUSE_MOVE 3u
+#define SYSCALL_INPUT_MOUSE_BUTTON 4u
+#define SYSCALL_INPUT_MOUSE_WHEEL 5u
+#define SYSCALL_INPUT_MOD_SHIFT (1u << 0)
+#define SYSCALL_INPUT_MOD_CTRL (1u << 1)
+#define SYSCALL_INPUT_MOD_ALT (1u << 2)
+#define SYSCALL_INPUT_BTN_LEFT (1u << 0)
+#define SYSCALL_INPUT_BTN_RIGHT (1u << 1)
+#define SYSCALL_INPUT_BTN_MIDDLE (1u << 2)
+#define SYSCALL_INPUT_QUEUE_CAPACITY 256u
+#define SYSCALL_INPUT_MAX_READ 256u
+#define SYSCALL_INPUT_MAX_TIMEOUT_MS 5000u
+
+typedef struct {
+    uint8_t type;
+    uint8_t key;
+    uint8_t mods;
+    uint8_t buttons;
+    int32_t dx;
+    int32_t dy;
+    int32_t wheel;
+    uint32_t time_ms;
+} syscall_input_event_t;
+
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    syscall_input_event_t* events;
+    uint32_t capacity;
+    uint32_t timeout_ms;
+    uint64_t* dropped_count;
+    uint32_t reserved[4];
+} syscall_input_read_request_t;
+
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t pixel_format;
+    uint8_t bytes_per_pixel;
+    uint8_t red_position;
+    uint8_t red_mask_size;
+    uint8_t green_position;
+    uint8_t green_mask_size;
+    uint8_t blue_position;
+    uint8_t blue_mask_size;
+    uint8_t reserved;
+} syscall_graphics_info_t;
+
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint32_t flags;
+    uint32_t src_w;
+    uint32_t src_h;
+    uint32_t src_pitch;
+    const uint32_t* src;
+    int32_t sx;
+    int32_t sy;
+    int32_t sw;
+    int32_t sh;
+    int32_t dx;
+    int32_t dy;
+    uint32_t reserved[4];
+} syscall_blit_request_t;
 
 typedef struct {
     uint64_t op;
@@ -130,6 +212,8 @@ typedef struct {
     const char* text;
     uint32_t* out_width;
     uint32_t* out_height;
+    const syscall_blit_request_t* blit;
+    syscall_graphics_info_t* info;
 } syscall_graphics_request_t;
 
 typedef enum {

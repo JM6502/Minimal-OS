@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "gfx_blit.h"
 #include "x86_64/gpu.h"
 
 // Color structure for convenience
@@ -13,6 +14,19 @@ typedef struct {
     uint8_t b;
     uint8_t a;  // Alpha (usually 0xFF for opaque)
 } color_t;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint8_t bytes_per_pixel;
+    uint8_t red_position;
+    uint8_t red_mask_size;
+    uint8_t green_position;
+    uint8_t green_mask_size;
+    uint8_t blue_position;
+    uint8_t blue_mask_size;
+} gfx_display_info_t;
 
 // Common colors
 #define COLOR_BLACK       ((color_t){0x00, 0x00, 0x00, 0xFF})
@@ -41,6 +55,11 @@ void graphics_init(void);
 // Get framebuffer dimensions
 uint32_t graphics_get_width(void);
 uint32_t graphics_get_height(void);
+bool graphics_get_display_info(gfx_display_info_t* info);
+bool graphics_backbuffer_blit(const gfx_surface_t* src,
+                              const gfx_rect_t* src_rect,
+                              int32_t dst_x, int32_t dst_y, bool alpha);
+bool graphics_backbuffer_present(const gfx_rect_t* rect);
 
 // Core drawing functions
 void graphics_write_pixel(int32_t x, int32_t y, uint8_t r, uint8_t g, uint8_t b);
@@ -149,6 +168,7 @@ void graphics_set_text_spacing(uint32_t letter_spacing, uint32_t line_spacing);
 // Single screen owner (first process to acquire gets exclusive drawing rights).
 bool graphics_claim_screen(void);
 bool graphics_release_screen(void);
+void graphics_release_screen_for_pid(uint64_t pid);
 bool graphics_has_screen_owner(void);
 uint64_t graphics_screen_owner_pid(void);
 

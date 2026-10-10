@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "x86_64/proc.h"
+#include "graphics.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/gdt.h"
@@ -779,6 +780,7 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
     current_process->exit_code = exit_code;
     current_process->crashed = crashed;
     current_process->crash_vector = crash_vector;
+    graphics_release_screen_for_pid(current_process->pid);
 
     serial_write_str("[PROC] Exiting process: ");
     serial_write_str(current_process->name);

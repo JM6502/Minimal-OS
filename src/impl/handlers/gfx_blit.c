@@ -1,10 +1,8 @@
 #include "gfx_blit.h"
+#include <stddef.h>
+#include <stdint.h>
 
-static inline int32_t gfx_min_i32(int32_t a, int32_t b) {
-    return a < b ? a : b;
-}
-
-static inline int32_t gfx_max_i32(int32_t a, int32_t b) {
+static inline int64_t gfx_max_i64(int64_t a, int64_t b) {
     return a > b ? a : b;
 }
 
@@ -27,12 +25,36 @@ static uint32_t gfx_blend_argb(uint32_t src, uint32_t dst) {
     }
 
     const uint32_t inv = 255u - (uint32_t)src_a;
-    const uint32_t out_a = (uint32_t)src_a + ((uint32_t)dst_a * inv) / 255u;
-    const uint32_t out_r = ((uint32_t)src_r * (uint32_t)src_a + (uint32_t)dst_r * inv) / 255u;
-    const uint32_t out_g = ((uint32_t)src_g * (uint32_t)src_a + (uint32_t)dst_g * inv) / 255u;
-    const uint32_t out_b = ((uint32_t)src_b * (uint32_t)src_a + (uint32_t)dst_b * inv) / 255u;
+    const uint32_t out_a_scaled = (uint32_t)src_a * 255u +
+                                  (uint32_t)dst_a * inv;
+    const uint32_t out_a = (out_a_scaled + 127u) / 255u;
+    const uint32_t out_r = ((uint32_t)src_r * src_a * 255u +
+                            (uint32_t)dst_r * dst_a * inv) / out_a_scaled;
+    const uint32_t out_g = ((uint32_t)src_g * src_a * 255u +
+                            (uint32_t)dst_g * dst_a * inv) / out_a_scaled;
+    const uint32_t out_b = ((uint32_t)src_b * src_a * 255u +
+                            (uint32_t)dst_b * dst_a * inv) / out_a_scaled;
 
     return (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
+}
+
+bool gfx_surface_valid(const gfx_surface_t* surface) {
+    if (!surface || !surface->pixels || !surface->width || !surface->height ||
+        surface->stride < surface->width) {
+        return false;
+    }
+
+    const uint64_t row_count = (uint64_t)surface->height - 1u;
+    const uint64_t stride = surface->stride;
+    if (row_count && stride > (UINT64_MAX - surface->width) / row_count) {
+        return false;
+    }
+    const uint64_t pixel_count = row_count * stride + surface->width;
+    if (pixel_count > SIZE_MAX / sizeof(uint32_t)) {
+        return false;
+    }
+
+    return surface->byte_length >= (size_t)pixel_count * sizeof(uint32_t);
 }
 
 bool gfx_clip_rect(const gfx_rect_t* a, const gfx_rect_t* b, gfx_rect_t* out) {
@@ -43,136 +65,128 @@ bool gfx_clip_rect(const gfx_rect_t* a, const gfx_rect_t* b, gfx_rect_t* out) {
         return false;
     }
 
-    const int32_t left = gfx_max_i32(a->x, b->x);
-    const int32_t top = gfx_max_i32(a->y, b->y);
-    const int32_t right = gfx_min_i32(a->x + a->w, b->x + b->w);
-    const int32_t bottom = gfx_min_i32(a->y + a->h, b->y + b->h);
+    const int64_t left = gfx_max_i64(a->x, b->x);
+    const int64_t top = gfx_max_i64(a->y, b->y);
+    const int64_t right_a = (int64_t)a->x + a->w;
+    const int64_t right_b = (int64_t)b->x + b->w;
+    const int64_t bottom_a = (int64_t)a->y + a->h;
+    const int64_t bottom_b = (int64_t)b->y + b->h;
+    const int64_t right = right_a < right_b ? right_a : right_b;
+    const int64_t bottom = bottom_a < bottom_b ? bottom_a : bottom_b;
 
     if (right <= left || bottom <= top) {
         return false;
     }
 
-    out->x = left;
-    out->y = top;
-    out->w = right - left;
-    out->h = bottom - top;
+    out->x = (int32_t)left;
+    out->y = (int32_t)top;
+    out->w = (int32_t)(right - left);
+    out->h = (int32_t)(bottom - top);
     return true;
 }
 
-void gfx_fill(uint32_t* dst, uint32_t width, uint32_t height, uint32_t stride,
-              const gfx_rect_t* rect, uint32_t color) {
-    if (!dst || !rect || width == 0u || height == 0u || stride < width) {
-        return;
-    }
+bool gfx_fill(gfx_surface_t* dst, const gfx_rect_t* rect, uint32_t color) {
+    if (!gfx_surface_valid(dst) || !rect) return false;
     if (rect->w <= 0 || rect->h <= 0) {
-        return;
+        return true;
     }
 
-    const int32_t x0 = gfx_max_i32(0, rect->x);
-    const int32_t y0 = gfx_max_i32(0, rect->y);
-    const int32_t x1 = gfx_min_i32((int32_t)width, rect->x + rect->w);
-    const int32_t y1 = gfx_min_i32((int32_t)height, rect->y + rect->h);
+    const int64_t x0 = rect->x > 0 ? rect->x : 0;
+    const int64_t y0 = rect->y > 0 ? rect->y : 0;
+    const int64_t right = (int64_t)rect->x + rect->w;
+    const int64_t bottom = (int64_t)rect->y + rect->h;
+    const int64_t x1 = right < dst->width ? right : dst->width;
+    const int64_t y1 = bottom < dst->height ? bottom : dst->height;
 
     if (x1 <= x0 || y1 <= y0) {
-        return;
+        return true;
     }
 
-    for (int32_t y = y0; y < y1; ++y) {
-        uint32_t* row = dst + ((uint32_t)y * stride);
-        for (int32_t x = x0; x < x1; ++x) {
+    for (int64_t y = y0; y < y1; ++y) {
+        uint32_t* row = dst->pixels + (size_t)y * dst->stride;
+        for (int64_t x = x0; x < x1; ++x) {
             row[x] = color;
         }
     }
+    return true;
 }
 
-void gfx_blit_opaque(uint32_t* dst, uint32_t dst_w, uint32_t dst_h, uint32_t dst_pitch,
-                     const uint32_t* src, uint32_t src_w, uint32_t src_h,
-                     int32_t src_x, int32_t src_y, int32_t src_wi, int32_t src_hi,
-                     int32_t dst_x, int32_t dst_y, int32_t clip_w, int32_t clip_h) {
-    if (!dst || !src || dst_w == 0u || dst_h == 0u || src_w == 0u || src_h == 0u) {
-        return;
+static bool gfx_blit(gfx_surface_t* dst, const gfx_surface_t* src,
+                     const gfx_rect_t* src_rect, int32_t dst_x, int32_t dst_y,
+                     bool alpha) {
+    if (!gfx_surface_valid(dst) || !gfx_surface_valid(src) || !src_rect) {
+        return false;
     }
-    if (src_wi <= 0 || src_hi <= 0 || clip_w <= 0 || clip_h <= 0) {
-        return;
-    }
+    if (src_rect->w <= 0 || src_rect->h <= 0) return true;
 
-    const int32_t max_y = gfx_min_i32(src_hi, (int32_t)src_h - src_y);
-    const int32_t max_x = gfx_min_i32(src_wi, (int32_t)src_w - src_x);
-    const int32_t copy_h = gfx_min_i32(max_y, clip_h);
-    const int32_t copy_w = gfx_min_i32(max_x, clip_w);
+    const int64_t start_x = gfx_max_i64(0, -((int64_t)src_rect->x));
+    const int64_t start_y = gfx_max_i64(0, -((int64_t)src_rect->y));
+    const int64_t clip_x = -((int64_t)dst_x);
+    const int64_t clip_y = -((int64_t)dst_y);
+    const int64_t x0 = start_x > clip_x ? start_x : clip_x;
+    const int64_t y0 = start_y > clip_y ? start_y : clip_y;
+    const int64_t src_right = (int64_t)src->width - src_rect->x;
+    const int64_t dst_right = (int64_t)dst->width - dst_x;
+    const int64_t src_bottom = (int64_t)src->height - src_rect->y;
+    const int64_t dst_bottom = (int64_t)dst->height - dst_y;
+    int64_t x1 = src_rect->w;
+    int64_t y1 = src_rect->h;
+    if (src_right < x1) x1 = src_right;
+    if (dst_right < x1) x1 = dst_right;
+    if (src_bottom < y1) y1 = src_bottom;
+    if (dst_bottom < y1) y1 = dst_bottom;
 
-    for (int32_t y = 0; y < copy_h; ++y) {
-        const int32_t src_row = src_y + y;
-        const int32_t dst_row = dst_y + y;
-        if (src_row < 0 || src_row >= (int32_t)src_h || dst_row < 0 || dst_row >= (int32_t)dst_h) {
-            continue;
-        }
-        const uint32_t* src_ptr = src + (uint32_t)src_row * src_w;
-        uint32_t* dst_ptr = dst + (uint32_t)dst_row * dst_pitch;
-        const int32_t x_start = gfx_max_i32(0, src_x);
-        const int32_t x_end = gfx_min_i32((int32_t)src_w, src_x + copy_w);
-        if (x_start >= x_end) {
-            continue;
-        }
-        for (int32_t x = x_start; x < x_end; ++x) {
-            const int32_t dst_col = dst_x + (x - src_x);
-            if (dst_col < 0 || dst_col >= (int32_t)dst_w) {
-                continue;
-            }
-            dst_ptr[dst_col] = src_ptr[x];
+    if (x1 <= x0 || y1 <= y0) return true;
+
+    for (int64_t y = y0; y < y1; ++y) {
+        const size_t src_row = (size_t)((int64_t)src_rect->y + y) * src->stride;
+        const size_t dst_row = (size_t)((int64_t)dst_y + y) * dst->stride;
+        for (int64_t x = x0; x < x1; ++x) {
+            const size_t src_index = src_row + (size_t)((int64_t)src_rect->x + x);
+            const size_t dst_index = dst_row + (size_t)((int64_t)dst_x + x);
+            dst->pixels[dst_index] = alpha
+                ? gfx_blend_argb(src->pixels[src_index], dst->pixels[dst_index])
+                : src->pixels[src_index];
         }
     }
+    return true;
 }
 
-void gfx_blit_alpha(uint32_t* dst, uint32_t dst_w, uint32_t dst_h, uint32_t dst_pitch,
-                    const uint32_t* src, uint32_t src_w, uint32_t src_h,
-                    int32_t src_x, int32_t src_y, int32_t src_wi, int32_t src_hi,
-                    int32_t dst_x, int32_t dst_y, int32_t clip_w, int32_t clip_h) {
-    if (!dst || !src || dst_w == 0u || dst_h == 0u || src_w == 0u || src_h == 0u) {
-        return;
-    }
-    if (src_wi <= 0 || src_hi <= 0 || clip_w <= 0 || clip_h <= 0) {
-        return;
-    }
-
-    const int32_t max_y = gfx_min_i32(src_hi, (int32_t)src_h - src_y);
-    const int32_t max_x = gfx_min_i32(src_wi, (int32_t)src_w - src_x);
-    const int32_t copy_h = gfx_min_i32(max_y, clip_h);
-    const int32_t copy_w = gfx_min_i32(max_x, clip_w);
-
-    for (int32_t y = 0; y < copy_h; ++y) {
-        const int32_t src_row = src_y + y;
-        const int32_t dst_row = dst_y + y;
-        if (src_row < 0 || src_row >= (int32_t)src_h || dst_row < 0 || dst_row >= (int32_t)dst_h) {
-            continue;
-        }
-        const uint32_t* src_ptr = src + (uint32_t)src_row * src_w;
-        uint32_t* dst_ptr = dst + (uint32_t)dst_row * dst_pitch;
-        for (int32_t x = 0; x < copy_w; ++x) {
-            const int32_t src_col = src_x + x;
-            const int32_t dst_col = dst_x + x;
-            if (src_col < 0 || src_col >= (int32_t)src_w || dst_col < 0 || dst_col >= (int32_t)dst_w) {
-                continue;
-            }
-            dst_ptr[dst_col] = gfx_blend_argb(src_ptr[src_col], dst_ptr[dst_col]);
-        }
-    }
+bool gfx_blit_opaque(gfx_surface_t* dst, const gfx_surface_t* src,
+                     const gfx_rect_t* src_rect, int32_t dst_x, int32_t dst_y) {
+    return gfx_blit(dst, src, src_rect, dst_x, dst_y, false);
 }
 
-void gfx_present_rect(uint32_t* dst, uint32_t dst_w, uint32_t dst_h, uint32_t dst_pitch,
-                     const uint32_t* src, uint32_t src_pitch,
-                     uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
-    if (!dst || !src || w == 0u || h == 0u || x >= dst_w || y >= dst_h) {
-        return;
+bool gfx_blit_alpha(gfx_surface_t* dst, const gfx_surface_t* src,
+                    const gfx_rect_t* src_rect, int32_t dst_x, int32_t dst_y) {
+    return gfx_blit(dst, src, src_rect, dst_x, dst_y, true);
+}
+
+bool gfx_present_rect(gfx_surface_t* dst, const gfx_surface_t* src,
+                      const gfx_rect_t* rect) {
+    if (!gfx_surface_valid(dst) || !gfx_surface_valid(src) || !rect) return false;
+    gfx_rect_t clipped;
+    const gfx_rect_t bounds = {
+        0, 0,
+        dst->width > INT32_MAX ? INT32_MAX : (int32_t)dst->width,
+        dst->height > INT32_MAX ? INT32_MAX : (int32_t)dst->height
+    };
+    if (!gfx_clip_rect(&bounds, rect, &clipped)) return true;
+    if (clipped.x < 0 || clipped.y < 0 ||
+        (uint64_t)(uint32_t)clipped.x + (uint32_t)clipped.w > src->width ||
+        (uint64_t)(uint32_t)clipped.y + (uint32_t)clipped.h > src->height) {
+        return false;
     }
 
-    const uint32_t copy_w = w < (dst_w - x) ? w : (dst_w - x);
-    const uint32_t copy_h = h < (dst_h - y) ? h : (dst_h - y);
-    for (uint32_t row = 0u; row < copy_h; ++row) {
-        const uint32_t* src_row = src + row * src_pitch;
-        uint32_t* dst_row = dst + (y + row) * dst_pitch;
-        for (uint32_t col = 0u; col < copy_w; ++col) {
-            dst_row[x + col] = src_row[col];
+    for (int32_t y = 0; y < clipped.h; ++y) {
+        const size_t src_index = (size_t)(clipped.y + y) * src->stride +
+                                 (uint32_t)clipped.x;
+        const size_t dst_index = (size_t)(clipped.y + y) * dst->stride +
+                                 (uint32_t)clipped.x;
+        for (int32_t x = 0; x < clipped.w; ++x) {
+            dst->pixels[dst_index + (uint32_t)x] =
+                src->pixels[src_index + (uint32_t)x];
         }
     }
+    return true;
 }

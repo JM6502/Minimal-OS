@@ -2,6 +2,7 @@
 #include "prochandler.h"
 #include "x86_64/gpu.h"
 #include "x86_64/allocator.h"
+#include "x86_64/spinlock.h"
 #include "panic.h"
 #include "serial.h"
 #include "string.h"
@@ -11,6 +12,11 @@
 
 // Global state
 static gpu_device_t* g_gpu = NULL;
+static uint32_t* g_backbuffer = NULL;
+static size_t g_backbuffer_bytes = 0;
+static uint32_t g_backbuffer_width = 0;
+static uint32_t g_backbuffer_height = 0;
+static spinlock_t g_graphics_lock = SPINLOCK_INIT;
 bool graphics_safety_mode = true;
 static terminal_t g_terminal = {0};
 static font_t g_current_font = {0};
@@ -21,31 +27,52 @@ static int last_y = -1;
 
 bool graphics_claim_screen(void) {
     const uint64_t pid = getCurrentPID();
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
     if (g_screen_owner_pid == UINT64_MAX || g_screen_owner_pid == pid) {
         g_screen_owner_pid = pid;
+        spinlock_release(&g_graphics_lock, flags);
         return true;
     }
+    spinlock_release(&g_graphics_lock, flags);
     return false;
 }
 
 bool graphics_release_screen(void) {
     const uint64_t pid = getCurrentPID();
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
     if (g_screen_owner_pid == UINT64_MAX) {
+        spinlock_release(&g_graphics_lock, flags);
         return true;
     }
     if (g_screen_owner_pid == pid) {
         g_screen_owner_pid = UINT64_MAX;
+        spinlock_release(&g_graphics_lock, flags);
         return true;
     }
+    spinlock_release(&g_graphics_lock, flags);
     return false;
 }
 
+void graphics_release_screen_for_pid(uint64_t pid) {
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
+    bool released = g_screen_owner_pid == pid;
+    if (released) g_screen_owner_pid = UINT64_MAX;
+    spinlock_release(&g_graphics_lock, flags);
+    if (released) graphics_terminal_redraw();
+}
+
 bool graphics_has_screen_owner(void) {
-    return g_screen_owner_pid != UINT64_MAX;
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
+    bool owned = g_screen_owner_pid != UINT64_MAX;
+    spinlock_release(&g_graphics_lock, flags);
+    return owned;
 }
 
 uint64_t graphics_screen_owner_pid(void) {
-    return g_screen_owner_pid;
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
+    uint64_t pid = g_screen_owner_pid;
+    spinlock_release(&g_graphics_lock, flags);
+    return pid;
 }
 
 // ===========================================
@@ -528,6 +555,7 @@ void graphics_terminal_set_color(color_t fg, color_t bg) {
 }
 
 void graphics_write_textr_char(char c) {
+    if (graphics_has_screen_owner()) return;
     invalidate_cursor();
 
     if (c == '\n') {
@@ -707,9 +735,49 @@ void graphics_init(void) {
     serial_write_str("\n");
 }
 
+static bool graphics_backbuffer_ensure_locked(void) {
+    if (!g_gpu || !g_gpu->fb || !g_gpu->width || !g_gpu->height ||
+        g_gpu->width > INT32_MAX || g_gpu->height > INT32_MAX ||
+        g_gpu->bpp != sizeof(uint32_t) || (g_gpu->pitch & 3u) != 0u ||
+        (uint64_t)g_gpu->pitch < (uint64_t)g_gpu->width * sizeof(uint32_t)) {
+        return false;
+    }
+
+    const uint64_t pixels = (uint64_t)g_gpu->width * g_gpu->height;
+    if (pixels > SIZE_MAX / sizeof(uint32_t)) return false;
+    const size_t bytes = (size_t)pixels * sizeof(uint32_t);
+    if (g_backbuffer && g_backbuffer_width == g_gpu->width &&
+        g_backbuffer_height == g_gpu->height) {
+        return true;
+    }
+
+    uint32_t* replacement = alloc(bytes);
+    if (!replacement) return false;
+    memset(replacement, 0, bytes);
+
+    uint32_t* previous = g_backbuffer;
+    g_backbuffer = replacement;
+    g_backbuffer_bytes = bytes;
+    g_backbuffer_width = g_gpu->width;
+    g_backbuffer_height = g_gpu->height;
+    free_mem(previous);
+    return true;
+}
+
 // Set GPU device (called from main after GPU initialization)
 void graphics_set_gpu(gpu_device_t* gpu) {
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
     g_gpu = gpu;
+    if (!gpu) {
+        free_mem(g_backbuffer);
+        g_backbuffer = NULL;
+        g_backbuffer_bytes = 0;
+        g_backbuffer_width = 0;
+        g_backbuffer_height = 0;
+    } else if (!graphics_backbuffer_ensure_locked()) {
+        serial_write_str("graphics: failed to allocate valid backbuffer\n");
+    }
+    spinlock_release(&g_graphics_lock, flags);
 }
 
 // Get framebuffer dimensions
@@ -719,6 +787,87 @@ uint32_t graphics_get_width(void) {
 
 uint32_t graphics_get_height(void) {
     return g_gpu ? g_gpu->height : 0;
+}
+
+bool graphics_get_display_info(gfx_display_info_t* info) {
+    if (!info) return false;
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
+    if (!g_gpu) {
+        spinlock_release(&g_graphics_lock, flags);
+        return false;
+    }
+    *info = (gfx_display_info_t){
+        .width = g_gpu->width,
+        .height = g_gpu->height,
+        .pitch = g_gpu->pitch,
+        .bytes_per_pixel = g_gpu->bpp,
+        .red_position = g_gpu->red_position,
+        .red_mask_size = g_gpu->red_mask_size,
+        .green_position = g_gpu->green_position,
+        .green_mask_size = g_gpu->green_mask_size,
+        .blue_position = g_gpu->blue_position,
+        .blue_mask_size = g_gpu->blue_mask_size
+    };
+    spinlock_release(&g_graphics_lock, flags);
+    return true;
+}
+
+bool graphics_backbuffer_blit(const gfx_surface_t* src,
+                              const gfx_rect_t* src_rect,
+                              int32_t dst_x, int32_t dst_y, bool alpha) {
+    if (!gfx_surface_valid(src) || !src_rect) return false;
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
+    if (!graphics_backbuffer_ensure_locked()) {
+        spinlock_release(&g_graphics_lock, flags);
+        return false;
+    }
+
+    gfx_surface_t dst = {
+        g_backbuffer, g_backbuffer_bytes, g_backbuffer_width,
+        g_backbuffer_height, g_backbuffer_width
+    };
+    bool result = alpha
+        ? gfx_blit_alpha(&dst, src, src_rect, dst_x, dst_y)
+        : gfx_blit_opaque(&dst, src, src_rect, dst_x, dst_y);
+    spinlock_release(&g_graphics_lock, flags);
+    return result;
+}
+
+bool graphics_backbuffer_present(const gfx_rect_t* rect) {
+    if (!rect || rect->w <= 0 || rect->h <= 0) return false;
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
+    if (!graphics_backbuffer_ensure_locked()) {
+        spinlock_release(&g_graphics_lock, flags);
+        return false;
+    }
+
+    const gfx_rect_t bounds = {
+        0, 0, (int32_t)g_gpu->width, (int32_t)g_gpu->height
+    };
+    gfx_rect_t clipped;
+    if (!gfx_clip_rect(rect, &bounds, &clipped)) {
+        spinlock_release(&g_graphics_lock, flags);
+        return true;
+    }
+
+    const bool fast_format = g_gpu->red_position == 16 &&
+        g_gpu->red_mask_size == 8 && g_gpu->green_position == 8 &&
+        g_gpu->green_mask_size == 8 && g_gpu->blue_position == 0 &&
+        g_gpu->blue_mask_size == 8;
+    for (int32_t y = 0; y < clipped.h; ++y) {
+        const uint32_t row = (uint32_t)(clipped.y + y);
+        volatile uint32_t* dst = (volatile uint32_t*)((uintptr_t)g_gpu->fb +
+            (size_t)row * g_gpu->pitch);
+        const uint32_t* src = g_backbuffer + (size_t)row * g_backbuffer_width;
+        for (int32_t x = 0; x < clipped.w; ++x) {
+            const uint32_t color = src[(uint32_t)clipped.x + (uint32_t)x];
+            dst[(uint32_t)clipped.x + (uint32_t)x] = fast_format
+                ? color & 0x00FFFFFFu
+                : gpu_pack_color(g_gpu, color & 0x00FFFFFFu);
+        }
+    }
+    spinlock_release(&g_graphics_lock, flags);
+    return true;
 }
 
 // Validate coordinates: returns false and sets x/y to -1 if GPU not ready,
@@ -765,7 +914,9 @@ void graphics_write_pixel(int32_t x, int32_t y, uint8_t r, uint8_t g, uint8_t b)
     if (!graphics_validate_coords(&x, &y)) return;
     
     uint32_t color = 0xFF000000 | (r << 16) | (g << 8) | b;
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
     gpu_put_pixel(g_gpu, (uint32_t)x, (uint32_t)y, color);
+    spinlock_release(&g_graphics_lock, flags);
 }
 
 void graphics_write_pixel_c(int32_t x, int32_t y, color_t color) {

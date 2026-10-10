@@ -1,4 +1,5 @@
 #include "keyboard/usbkeyboard.h"
+#include "input.h"
 #include "serial.h"
 #include "string.h"
 #include "time.h"
@@ -176,6 +177,11 @@ static void usb_keyboard_handle_key_press(uint8_t scancode, uint8_t modifiers) {
         return;
     }
 
+    uint8_t mods = (g_keyboard_state.shift ? SYSCALL_INPUT_MOD_SHIFT : 0) |
+                   (g_keyboard_state.ctrl ? SYSCALL_INPUT_MOD_CTRL : 0) |
+                   (g_keyboard_state.alt ? SYSCALL_INPUT_MOD_ALT : 0);
+    input_event_push(SYSCALL_INPUT_KEY_DOWN, scancode, mods, 0, 0, 0, 0);
+
     if (character) {
         __atomic_store_n(&g_pending_key_event, (uint32_t)(uint8_t)character,
                          __ATOMIC_RELEASE);
@@ -199,6 +205,11 @@ static void usb_keyboard_handle_key_release(uint8_t scancode) {
     if (usb_keyboard_is_modifier(scancode)) {
         return;
     }
+
+    uint8_t mods = (g_keyboard_state.shift ? SYSCALL_INPUT_MOD_SHIFT : 0) |
+                   (g_keyboard_state.ctrl ? SYSCALL_INPUT_MOD_CTRL : 0) |
+                   (g_keyboard_state.alt ? SYSCALL_INPUT_MOD_ALT : 0);
+    input_event_push(SYSCALL_INPUT_KEY_UP, scancode, mods, 0, 0, 0, 0);
     
     // Call user callback
     if (g_user_callback) {

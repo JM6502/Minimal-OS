@@ -121,10 +121,27 @@ kernel access.
 wrappers for:
 
 - width and height queries;
+- bounded opaque or alpha surface blits into a kernel back buffer;
+- dirty-rectangle presentation and packed framebuffer information;
 - clear, pixel, line, rectangle, circle, triangle, and ellipse drawing;
 - text output and text measurement;
 - resolution changes;
 - terminal clear.
+
+Screen ownership uses `mos_graphics_acquire()`, `mos_graphics_release()`, and
+`mos_graphics_owner()`. A process must acquire the screen before drawing; only
+the owner may perform drawing operations. Acquire fails with `SYS_ERR_PERM` if
+another process owns the screen. Release redraws the terminal, and ownership is
+reported as a PID or `SYS_ERR_NOTFOUND` when no process owns it.
+
+`mos_graphics_blit_surface()` accepts an ARGB8888 source surface, byte pitch,
+source rectangle, destination origin, and either `SYS_GRAPHICS_BLIT_OPAQUE` or
+`SYS_GRAPHICS_BLIT_ALPHA`. The complete source range must belong to one live
+user-heap allocation. The kernel caps each source at 64 MiB and stages it before
+compositing. `mos_graphics_present(x, y, width, height)` copies a clipped dirty
+rectangle to the framebuffer and is owner-only. `mos_graphics_info()` fills a
+versioned `syscall_graphics_info_t` with dimensions, pitch, framebuffer channel
+layout, and the back-buffer format `SYS_GRAPHICS_PIXEL_FORMAT_ARGB8888`.
 
 Use `graphics.h` for the shorter API or `x86_64/user_graphics.h` for raw-style
 wrappers. Coordinates and sizes are passed in the request's integer argument
@@ -147,6 +164,14 @@ has-data, and sample-rate configuration.
 
 `SYS_MOUSE` provides mouse initialization, polling, presence, and accumulated
 relative state (`dx`, `dy`, wheel, and button bitmask).
+
+`SYS_INPUT_READ` consumes key down/up, mouse motion/button, and wheel events
+from a 256-entry bounded queue. Only the graphics screen owner may read it.
+`mos_input_read(events, capacity, timeout_ms, dropped_count)` caps each read at
+256 events and the blocking timeout at 5 seconds; a zero timeout polls once.
+When no graphics owner is active, the queue ignores hardware input so the
+terminal remains the input consumer. Overflow drops the newest event and
+increments the optional dropped-event counter.
 
 ## Packages
 

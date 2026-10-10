@@ -181,6 +181,7 @@ static void terminal_history_down(void) {
 // ===========================================
 
 void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) {
+    if (graphics_has_screen_owner()) return;
     if (!pressed) return;  // Only handle key presses
 
     /*

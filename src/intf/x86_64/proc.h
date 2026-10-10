@@ -124,6 +124,10 @@ typedef struct process {
     uint8_t exit_code;
     bool crashed;
     uint8_t crash_vector;
+    uintptr_t user_image_address;
+    size_t user_image_size;
+    uintptr_t user_stack_address;
+    size_t user_stack_size;
 } process_t;
 
 // Global process list head (defined in proc.c)
@@ -162,6 +166,10 @@ int proc_map_user_heap_range(process_t* proc, void* address, size_t length);
 int proc_unmap_user_heap_range(process_t* proc, void* address, size_t length);
 int proc_user_heap_track(process_t* proc, void* address, size_t size);
 int proc_user_heap_contains(process_t* proc, void* address);
+int proc_user_heap_contains_range(process_t* proc, const void* address,
+                                  size_t length);
+int proc_user_range_contains(process_t* proc, const void* address,
+                             size_t length);
 int proc_user_heap_untrack(process_t* proc, void* address);
 int proc_user_heap_resize(process_t* proc, void* old_address,
                           void* new_address, size_t new_size);

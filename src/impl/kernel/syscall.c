@@ -27,6 +27,7 @@
 #include "x86_64/runcommand.h"
 #include "x86_64/proc.h"
 #include "fspaths.h"
+#include "input.h"
 
 static minimafs_dir_entry_t g_listdir_entries[MINIMAFS_MAX_ROOT_ENTRIES];
 static volatile int     g_listdir_entries_lock;
@@ -47,7 +48,7 @@ static bool user_range_ok(const void* ptr, size_t len, bool write) {
     if (addr > UINTPTR_MAX - len) return false;
 
     if (current_process && current_process->privilege == PROC_PRIVILEGE_USER) {
-        if (!proc_user_heap_contains(current_process, (void*)ptr)) {
+        if (!proc_user_range_contains(current_process, ptr, len)) {
             return false;
         }
     }
@@ -75,7 +76,11 @@ static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
 }
 
 static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
-    if (!request) return SYS_ERR_INVAL;
+    if (!request ||
+        (isCurrentProcessUser() &&
+         !user_range_ok(request, sizeof(*request), false))) {
+        return SYS_ERR_INVAL;
+    }
 
     const int64_t* a = request->args;
     const bool requires_screen_owner =
@@ -91,7 +96,9 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
         request->op == SYS_GRAPHICS_ELLIPSE ||
         request->op == SYS_GRAPHICS_TEXT ||
         request->op == SYS_GRAPHICS_SET_RESOLUTION ||
-        request->op == SYS_GRAPHICS_TERMINAL_CLEAR;
+        request->op == SYS_GRAPHICS_TERMINAL_CLEAR ||
+        request->op == SYS_GRAPHICS_BLIT ||
+        request->op == SYS_GRAPHICS_PRESENT;
 
     if (requires_screen_owner &&
         (!graphics_has_screen_owner() || graphics_screen_owner_pid() != getCurrentPID())) {
@@ -103,6 +110,30 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
             return graphics_get_width();
         case SYS_GRAPHICS_GET_HEIGHT:
             return graphics_get_height();
+        case SYS_GRAPHICS_INFO: {
+            syscall_graphics_info_t* output = request->info;
+            if (!output || !user_range_ok(output, sizeof(*output), true) ||
+                output->size != sizeof(*output) ||
+                output->version != SYS_GRAPHICS_ABI_VERSION ||
+                output->reserved != 0) {
+                serial_write_str("SYS_GRAPHICS_INFO: invalid output structure\n");
+                return SYS_ERR_INVAL;
+            }
+            gfx_display_info_t display;
+            if (!graphics_get_display_info(&display)) return SYS_ERR_GENERIC;
+            output->width = display.width;
+            output->height = display.height;
+            output->pitch = display.pitch;
+            output->pixel_format = SYS_GRAPHICS_PIXEL_FORMAT_ARGB8888;
+            output->bytes_per_pixel = display.bytes_per_pixel;
+            output->red_position = display.red_position;
+            output->red_mask_size = display.red_mask_size;
+            output->green_position = display.green_position;
+            output->green_mask_size = display.green_mask_size;
+            output->blue_position = display.blue_position;
+            output->blue_mask_size = display.blue_mask_size;
+            return SYS_SUCCESS;
+        }
         case SYS_GRAPHICS_ACQUIRE:
             return graphics_claim_screen() ? SYS_SUCCESS : SYS_ERR_PERM;
         case SYS_GRAPHICS_RELEASE:
@@ -113,6 +144,77 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
             return SYS_ERR_PERM;
         case SYS_GRAPHICS_OWNER:
             return graphics_has_screen_owner() ? graphics_screen_owner_pid() : SYS_ERR_NOTFOUND;
+        case SYS_GRAPHICS_BLIT: {
+            const syscall_blit_request_t* blit = request->blit;
+            if (isCurrentProcessUser() &&
+                !user_range_ok(blit, sizeof(*blit), false)) {
+                serial_write_str("SYS_GRAPHICS_BLIT: invalid request pointer\n");
+                return SYS_ERR_INVAL;
+            }
+            if (!blit || blit->size != sizeof(*blit) ||
+                blit->version != SYS_GRAPHICS_ABI_VERSION ||
+                (blit->flags != SYS_GRAPHICS_BLIT_OPAQUE &&
+                 blit->flags != SYS_GRAPHICS_BLIT_ALPHA) ||
+                !blit->src || ((uintptr_t)blit->src & 3u) != 0u ||
+                !blit->src_w || !blit->src_h ||
+                blit->src_w > SYSCALL_GFX_MAX_DIMENSION ||
+                blit->src_h > SYSCALL_GFX_MAX_DIMENSION ||
+                blit->sx < 0 || blit->sy < 0 || blit->sw <= 0 || blit->sh <= 0 ||
+                (uint64_t)(uint32_t)blit->sx + (uint32_t)blit->sw > blit->src_w ||
+                (uint64_t)(uint32_t)blit->sy + (uint32_t)blit->sh > blit->src_h) {
+                serial_write_str("SYS_GRAPHICS_BLIT: invalid request\n");
+                return SYS_ERR_INVAL;
+            }
+            for (size_t i = 0; i < 4; ++i) {
+                if (blit->reserved[i] != 0) {
+                    serial_write_str("SYS_GRAPHICS_BLIT: reserved field set\n");
+                    return SYS_ERR_INVAL;
+                }
+            }
+
+            const uint64_t min_pitch = (uint64_t)blit->src_w * sizeof(uint32_t);
+            const uint64_t source_bytes = (uint64_t)blit->src_pitch * blit->src_h;
+            if ((blit->src_pitch & 3u) != 0u || blit->src_pitch < min_pitch ||
+                source_bytes > SYSCALL_GFX_MAX_BUFFER_BYTES ||
+                source_bytes > SIZE_MAX ||
+                !user_range_ok(blit->src, (size_t)source_bytes, false)) {
+                serial_write_str("SYS_GRAPHICS_BLIT: invalid source range or pitch\n");
+                return SYS_ERR_INVAL;
+            }
+
+            uint32_t* staging = alloc((size_t)source_bytes);
+            if (!staging) {
+                serial_write_str("SYS_GRAPHICS_BLIT: staging allocation failed\n");
+                return SYS_ERR_GENERIC;
+            }
+            memcpy(staging, blit->src, (size_t)source_bytes);
+            gfx_surface_t source = {
+                staging, (size_t)source_bytes, blit->src_w,
+                blit->src_h, blit->src_pitch / sizeof(uint32_t)
+            };
+            gfx_rect_t source_rect = {
+                blit->sx, blit->sy, blit->sw, blit->sh
+            };
+            bool ok = graphics_backbuffer_blit(&source, &source_rect,
+                blit->dx, blit->dy, blit->flags == SYS_GRAPHICS_BLIT_ALPHA);
+            free_mem(staging);
+            if (!ok) {
+                serial_write_str("SYS_GRAPHICS_BLIT: backbuffer blit failed\n");
+                return SYS_ERR_GENERIC;
+            }
+            return SYS_SUCCESS;
+        }
+        case SYS_GRAPHICS_PRESENT: {
+            gfx_rect_t rect = {
+                (int32_t)a[0], (int32_t)a[1],
+                (int32_t)a[2], (int32_t)a[3]
+            };
+            if (!graphics_backbuffer_present(&rect)) {
+                serial_write_str("SYS_GRAPHICS_PRESENT: invalid rectangle or framebuffer\n");
+                return SYS_ERR_INVAL;
+            }
+            return SYS_SUCCESS;
+        }
         case SYS_GRAPHICS_CLEAR:
             graphics_clear((uint8_t)a[0], (uint8_t)a[1], (uint8_t)a[2]);
             return SYS_SUCCESS;
@@ -348,6 +450,56 @@ static uint64_t sys_mouse_impl(uint64_t operation, uint64_t arg1, uint64_t arg2)
         default:
             return SYS_ERR_INVAL;
     }
+}
+
+static uint64_t sys_input_read_impl(const syscall_input_read_request_t* request) {
+    if (!request || !user_range_ok(request, sizeof(*request), false) ||
+        request->size != sizeof(*request) ||
+        request->version != SYS_INPUT_ABI_VERSION ||
+        !request->events || request->capacity == 0 ||
+        request->capacity > SYSCALL_INPUT_MAX_READ ||
+        request->timeout_ms > SYSCALL_INPUT_MAX_TIMEOUT_MS) {
+        serial_write_str("SYS_INPUT_READ: invalid request\n");
+        return SYS_ERR_INVAL;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        if (request->reserved[i] != 0) {
+            serial_write_str("SYS_INPUT_READ: reserved field set\n");
+            return SYS_ERR_INVAL;
+        }
+    }
+    const size_t events_bytes =
+        (size_t)request->capacity * sizeof(syscall_input_event_t);
+    if (!user_range_ok(request->events, events_bytes, true) ||
+        (request->dropped_count &&
+         !user_range_ok(request->dropped_count,
+                        sizeof(*request->dropped_count), true))) {
+        serial_write_str("SYS_INPUT_READ: invalid output range\n");
+        return SYS_ERR_INVAL;
+    }
+    if (!graphics_has_screen_owner() ||
+        graphics_screen_owner_pid() != getCurrentPID()) {
+        return SYS_ERR_PERM;
+    }
+
+    syscall_input_event_t events[SYSCALL_INPUT_MAX_READ];
+    uint64_t start = time_get_uptime_ms();
+    uint32_t count = 0;
+    do {
+        count = input_event_drain(events, request->capacity);
+        if (count || request->timeout_ms == 0 ||
+            time_get_uptime_ms() - start >= request->timeout_ms) {
+            break;
+        }
+        sleep(1);
+    } while (true);
+
+    if (count) memcpy(request->events, events,
+                      (size_t)count * sizeof(syscall_input_event_t));
+    if (request->dropped_count) {
+        *request->dropped_count = input_event_dropped_count();
+    }
+    return count;
 }
 
 /*
@@ -647,6 +799,10 @@ static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc
 static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* regs) {
     switch (syscall_num) {
         case SYS_GRAPHICS: {
+            if (!user_range_ok((const void*)regs->rdi,
+                               sizeof(syscall_graphics_request_t), false)) {
+                return false;
+            }
             const syscall_graphics_request_t* req =
                 (const syscall_graphics_request_t*)regs->rdi;
             if (!req) return true;
@@ -657,6 +813,9 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
                     return true;
                 case SYS_GRAPHICS_ACQUIRE:
                 case SYS_GRAPHICS_RELEASE:
+                case SYS_GRAPHICS_BLIT:
+                case SYS_GRAPHICS_PRESENT:
+                case SYS_GRAPHICS_INFO:
                     return true;
                 default:
                     return false;
@@ -740,6 +899,10 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
                     return true;
             }
         }
+
+        case SYS_INPUT_READ:
+            return user_range_ok((const void*)regs->rdi,
+                                 sizeof(syscall_input_read_request_t), false);
 
         default:
             // Everything else (SYS_WRITE, file I/O, graphics drawing,
@@ -1054,6 +1217,11 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_MOUSE:
             regs->rax = sys_mouse_impl(regs->rdi, regs->rsi, regs->rdx);
+            break;
+
+        case SYS_INPUT_READ:
+            regs->rax = sys_input_read_impl(
+                (const syscall_input_read_request_t*)regs->rdi);
             break;
 
         case SYS_GETTIME: {
