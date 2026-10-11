@@ -11,6 +11,24 @@ A service is registered only when it has at least one `[STARTUP]` action:
 `exec` or `script`. The terminal command `services` lists entries that parsed
 and registered successfully.
 
+Services are optional modules. In particular, the window manager is not
+required to boot or use the built-in terminal. Installing its executable alone
+does not start it; automatic startup is enabled by placing its
+`mosWM.service` definition in `0:/services`. If the definition or executable is
+missing, service discovery skips the entry and the OS continues without a
+window manager. Remove the service definition and reboot to disable automatic
+startup.
+
+```ini
+[GENERAL]
+name="mosWM"
+desc="Optional graphical window manager"
+exit=None
+
+[STARTUP]
+exec="0:/programs/mosWM/mosWM.run"
+```
+
 ## File Format
 
 ```ini

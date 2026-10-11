@@ -2,9 +2,11 @@
 #include "x86_64/scheduler.h"
 #include "x86_64/proc.h"
 #include "x86_64/gpu.h"
+#include "graphics.h"
 #include "serial.h"
 #include "panic.h"
 #include "time.h"
+#include "x86_64/window_manager.h"
 
 // ===========================================
 // GPU DEVICE ACCESS
@@ -105,6 +107,8 @@ bool killProcess(uint64_t pid) {
     // comment on scheduler_dequeue() in scheduler.h for why this can't
     // just be left to happen lazily anymore now that queues are
     // per-CPU linked lists rather than one global list scan.
+    window_manager_process_exit(proc->pid);
+    graphics_release_screen_for_pid(proc->pid);
     proc->state = PROCESS_ZOMBIE;
     scheduler_dequeue(proc);
     

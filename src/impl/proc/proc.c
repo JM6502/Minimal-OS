@@ -4,6 +4,8 @@
 #include "x86_64/proc.h"
 #include "x86_64/gdt.h"
 #include "x86_64/scheduler.h"
+#include "graphics.h"
+#include "x86_64/window_manager.h"
 #include "x86_64/allocator.h"
 #include "x86_64/pmm.h"
 #include "time.h"
@@ -504,6 +506,12 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 	proc->pid = get_next_pid();
 	proc->state = PROCESS_READY;
 	proc->privilege = privilege;
+	proc->parent_pid = current_process ? current_process->pid : 0;
+	proc->is_window_manager =
+		privilege == PROC_PRIVILEGE_USER && file_name &&
+		current_process &&
+		current_process->privilege == PROC_PRIVILEGE_KERNEL &&
+		strcmp(file_name, "0:/programs/mosWM/mosWM.run") == 0;
 
 	// Initialize timing fields
 	proc->wake_time_ms = 0;
@@ -631,6 +639,8 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 
 void kill(process_t* proc) {
 	if (!proc) return;
+	window_manager_process_exit(proc->pid);
+	graphics_release_screen_for_pid(proc->pid);
 	proc->state = PROCESS_ZOMBIE;
 	// Pull it out of whatever per-CPU run queue it's sitting in so it
 	// can never be dispatched again, and so the zombie-cleanup pass in

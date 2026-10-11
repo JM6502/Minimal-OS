@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "x86_64/proc.h"
+#include "x86_64/window_manager.h"
 #include "graphics.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/commandhandler.h"
@@ -668,6 +669,8 @@ static void expire_cleanup_requests(void) {
         serial_write_str("[PROC] Cleanup timeout, terminating ");
         serial_write_str(proc->name);
         serial_write_str("\n");
+        window_manager_process_exit(proc->pid);
+        graphics_release_screen_for_pid(proc->pid);
         proc->state = PROCESS_ZOMBIE;
         scheduler_dequeue(proc);
         if (proc == current_process) schedule();
@@ -780,6 +783,7 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
     current_process->exit_code = exit_code;
     current_process->crashed = crashed;
     current_process->crash_vector = crash_vector;
+    window_manager_process_exit(current_process->pid);
     graphics_release_screen_for_pid(current_process->pid);
 
     serial_write_str("[PROC] Exiting process: ");

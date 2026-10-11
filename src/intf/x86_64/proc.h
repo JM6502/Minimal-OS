@@ -128,6 +128,8 @@ typedef struct process {
     size_t user_image_size;
     uintptr_t user_stack_address;
     size_t user_stack_size;
+    uint64_t parent_pid;
+    bool is_window_manager;
 } process_t;
 
 // Global process list head (defined in proc.c)

@@ -28,6 +28,7 @@
 #include "x86_64/proc.h"
 #include "fspaths.h"
 #include "input.h"
+#include "x86_64/window_manager.h"
 
 static minimafs_dir_entry_t g_listdir_entries[MINIMAFS_MAX_ROOT_ENTRIES];
 static volatile int     g_listdir_entries_lock;
@@ -182,18 +183,27 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
                 return SYS_ERR_INVAL;
             }
 
-            uint32_t* staging = alloc((size_t)source_bytes);
+            const size_t row_bytes = (size_t)blit->sw * sizeof(uint32_t);
+            const size_t staging_bytes = row_bytes * (size_t)blit->sh;
+            uint32_t* staging = alloc(staging_bytes);
             if (!staging) {
                 serial_write_str("SYS_GRAPHICS_BLIT: staging allocation failed\n");
                 return SYS_ERR_GENERIC;
             }
-            memcpy(staging, blit->src, (size_t)source_bytes);
+            const uint32_t* source_pixels = blit->src +
+                (size_t)blit->sy * (blit->src_pitch / sizeof(uint32_t)) +
+                (size_t)blit->sx;
+            for (int32_t row = 0; row < blit->sh; row++) {
+                memcpy((uint8_t*)staging + (size_t)row * row_bytes,
+                       source_pixels + (size_t)row * (blit->src_pitch / sizeof(uint32_t)),
+                       row_bytes);
+            }
             gfx_surface_t source = {
-                staging, (size_t)source_bytes, blit->src_w,
-                blit->src_h, blit->src_pitch / sizeof(uint32_t)
+                staging, staging_bytes, (uint32_t)blit->sw,
+                (uint32_t)blit->sh, (uint32_t)blit->sw
             };
             gfx_rect_t source_rect = {
-                blit->sx, blit->sy, blit->sw, blit->sh
+                0, 0, blit->sw, blit->sh
             };
             bool ok = graphics_backbuffer_blit(&source, &source_rect,
                 blit->dx, blit->dy, blit->flags == SYS_GRAPHICS_BLIT_ALPHA);
@@ -500,6 +510,78 @@ static uint64_t sys_input_read_impl(const syscall_input_read_request_t* request)
         *request->dropped_count = input_event_dropped_count();
     }
     return count;
+}
+
+static uint64_t sys_window_impl(const syscall_window_request_t* request) {
+    if (!request || !user_range_ok(request, sizeof(*request), false) ||
+        request->size != sizeof(*request) ||
+        request->version != SYS_WINDOW_ABI_VERSION)
+        return SYS_ERR_INVAL;
+
+    switch (request->op) {
+        case SYS_WINDOW_PRESENT: {
+            if (!request->pixels || !request->width || !request->height ||
+                request->x > SYSCALL_GFX_MAX_DIMENSION ||
+                request->y > SYSCALL_GFX_MAX_DIMENSION ||
+                request->width > SYSCALL_GFX_MAX_DIMENSION - request->x ||
+                request->height > SYSCALL_GFX_MAX_DIMENSION - request->y ||
+                request->pitch < (request->x + request->width) *
+                                     sizeof(uint32_t) ||
+                request->pitch > SYSCALL_GFX_MAX_BUFFER_BYTES)
+                return SYS_ERR_INVAL;
+            uint64_t bytes = (uint64_t)(request->y + request->height - 1u) *
+                             request->pitch +
+                             (uint64_t)(request->x + request->width) *
+                             sizeof(uint32_t);
+            if (bytes > SYSCALL_GFX_MAX_BUFFER_BYTES ||
+                !user_range_ok(request->pixels, (size_t)bytes, false))
+                return SYS_ERR_INVAL;
+            break;
+        }
+        case SYS_WINDOW_GET_INFO:
+            if (!request->info ||
+                !user_range_ok(request->info, sizeof(*request->info), true))
+                return SYS_ERR_INVAL;
+            break;
+        case SYS_WINDOW_LIST:
+            if (request->capacity > SYSCALL_WINDOW_MAX_WINDOWS ||
+                (request->capacity &&
+                 (!request->windows ||
+                  !user_range_ok(request->windows,
+                      (size_t)request->capacity * sizeof(*request->windows),
+                      true))))
+                return SYS_ERR_INVAL;
+            break;
+        case SYS_WINDOW_GET_FRAME: {
+            if (!request->frame ||
+                !user_range_ok(request->frame, sizeof(*request->frame), false))
+                return SYS_ERR_INVAL;
+            syscall_window_frame_t* frame = request->frame;
+            if (!frame->pixels || !frame->width || !frame->height ||
+                frame->width > SYSCALL_GFX_MAX_DIMENSION ||
+                frame->height > SYSCALL_GFX_MAX_DIMENSION ||
+                frame->pitch < frame->width * sizeof(uint32_t) ||
+                frame->pitch > SYSCALL_GFX_MAX_BUFFER_BYTES ||
+                (uint64_t)frame->pitch * frame->height >
+                    SYSCALL_GFX_MAX_BUFFER_BYTES ||
+                !user_range_ok(frame->pixels,
+                               (size_t)frame->pitch * frame->height, true))
+                return SYS_ERR_INVAL;
+            break;
+        }
+        case SYS_WINDOW_NEXT_EVENT:
+        case SYS_WINDOW_POST_EVENT:
+            if (!request->event ||
+                !user_range_ok(request->event, sizeof(*request->event),
+                    request->op == SYS_WINDOW_NEXT_EVENT))
+                return SYS_ERR_INVAL;
+            break;
+        default:
+            break;
+    }
+
+    return window_manager_syscall(request, getCurrentPID(),
+        current_process && current_process->is_window_manager);
 }
 
 /*
@@ -883,10 +965,11 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
                     // in the system, including the keyboard everyone
                     // else is relying on.
                     return false;
+                case SYS_USB_KEY_IS_PRESSED:
+                    return graphics_has_screen_owner() &&
+                           graphics_screen_owner_pid() == getCurrentPID();
                 default:
-                    // Polling and read-only keyboard queries are
-                    // side-effect-free (or self-contained) enough to
-                    // allow.
+                    // Polling and keyboard metadata queries are safe to allow.
                     return true;
             }
         }
@@ -895,6 +978,12 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
             switch (operation) {
                 case SYS_MOUSE_INIT:
                     return false;
+                case SYS_MOUSE_GET_STATE:
+                    // Raw pointer state belongs to the active display server;
+                    // applications receive pointer events through their own
+                    // window event queues instead.
+                    return graphics_has_screen_owner() &&
+                           graphics_screen_owner_pid() == getCurrentPID();
                 default:
                     return true;
             }
@@ -903,6 +992,10 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
         case SYS_INPUT_READ:
             return user_range_ok((const void*)regs->rdi,
                                  sizeof(syscall_input_read_request_t), false);
+
+        case SYS_WINDOW:
+            return user_range_ok((const void*)regs->rdi,
+                                 sizeof(syscall_window_request_t), false);
 
         default:
             // Everything else (SYS_WRITE, file I/O, graphics drawing,
@@ -1222,6 +1315,11 @@ void syscall_dispatch(syscall_regs_t* regs) {
         case SYS_INPUT_READ:
             regs->rax = sys_input_read_impl(
                 (const syscall_input_read_request_t*)regs->rdi);
+            break;
+
+        case SYS_WINDOW:
+            regs->rax = sys_window_impl(
+                (const syscall_window_request_t*)regs->rdi);
             break;
 
         case SYS_GETTIME: {
